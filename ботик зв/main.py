@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # Telegram Bot
 API_ID = 12345
 API_HASH = "your_api_hash"
-BOT_TOKEN = "7867924002:AAFIsZ0EPEHnId4HC8il4b8IrTW9Ilh3F_E"
+BOT_TOKEN = ""
 
 # Администраторы
 ADMIN_IDS = [8429942952]
