@@ -3,7 +3,8 @@
 
 """
 Telegram Bot for selling Telegram Stars and Premium
-Expanded admin functions, profile-based balance management
+Works ONLY with Bot Token - no API ID or API Hash required!
+Auto-delivery via Fragment API with webhooks
 """
 
 import asyncio
@@ -15,142 +16,199 @@ import time
 import hashlib
 import hmac
 import logging
-import re
-from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple, List, Any
+import os
+import sys
+from datetime import datetime
+from typing import Dict, Optional, Tuple, List
 from contextlib import contextmanager
-from enum import Enum
+from functools import wraps
 
-import aiohttp
-from aiohttp import web
-from pyrogram import Client, filters
-from pyrogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
-    Message, User, InputMediaPhoto, InputMediaVideo,
-    InputMediaAudio, InputMediaDocument, WebAppInfo
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    CallbackQuery, User, Bot
 )
-from pyrogram.enums import ParseMode, MessageEntityType, ChatMemberStatus
-from pyrogram.errors import UserNotParticipant, FloodWait, PeerIdInvalid
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, PreCheckoutQueryHandler
+)
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+
+from flask import Flask, request, jsonify
+import threading
+import requests
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # ================= КОНФИГУРАЦИЯ =================
 
-# Telegram Bot
-API_ID = 12345
-API_HASH = "your_api_hash"
-BOT_TOKEN = ""
+# ТОЛЬКО ТОКЕН БОТА (получить у @BotFather)
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # ← ЗАМЕНИТЕ НА ВАШ ТОКЕН!
 
-# Администраторы
-ADMIN_IDS = [8429942952]
+# Администраторы (Telegram ID)
+ADMIN_IDS = [123456789]  # ← ЗАМЕНИТЕ НА ВАШ ID!
 
 # Webhook настройки
-WEBHOOK_HOST = "https://your-domain.com"
-WEBHOOK_PORT = 3000
-WEBHOOK_PATH = "/webhook"
+WEBHOOK_HOST = "https://your-domain.com"  # ← ЗАМЕНИТЕ НА ВАШ ДОМЕН!
+WEBHOOK_PORT = 8443
+WEBHOOK_URL = f"{WEBHOOK_HOST}/webhook"
 
-# CryptoBot
-CRYPTOBOT_TOKEN = "your_cryptobot_token"
+# CryptoBot настройки (https://t.me/CryptoBot)
+CRYPTOBOT_TOKEN = "your_cryptobot_token"  # ← ТОКЕН ОТ CRYPTOBOT
 CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
 
-# Platega.io
+# Platega.io настройки
 PLATEGA_MERCHANT_ID = "your_merchant_id"
 PLATEGA_SECRET_KEY = "your_secret_key"
 PLATEGA_API_URL = "https://platega.io/api/v1"
 
-# Fragment API
-FRAGMENT_SEED = "word1 word2 ... word24"
-FRAGMENT_API_KEY = "your_tonapi_key"
-FRAGMENT_COOKIES = {
-    "stel_ssid": "your_ssid",
-    "stel_dt": "your_dt",
-    "stel_token": "your_token",
-    "stel_ton_token": "your_ton_token",
-}
-
-# Премиум эмодзи
-PREMIUM_EMOJI_IDS = {
-    "star": 5343528654456496221,
-    "fire": 5343615236702215768,
-    "crown": 5343543193031085986,
-    "sparkles": 5343579263228451028,
-    "rocket": 5343585422010155027,
-    "heart": 5343524811580579204,
-}
-
-# Обычные эмодзи
-EMOJI = {
-    "star": "⭐",
-    "gold_star": "🌟",
-    "fire": "🔥",
-    "crown": "👑",
-    "sparkles": "✨",
-    "rocket": "🚀",
-    "heart": "❤️",
-    "diamond": "💎",
-    "gift": "🎁",
-    "warning": "⚠️",
-    "check": "✅",
-    "cross": "❌",
-    "info": "ℹ️",
-    "settings": "⚙️",
-    "wallet": "💰",
-    "users": "👥",
-    "stats": "📊",
-    "mail": "📧",
-    "code": "🎟️",
-    "lock": "🔒",
-    "unlock": "🔓",
-    "plus": "➕",
-    "minus": "➖",
-    "edit": "✏️",
-    "delete": "🗑️",
-    "list": "📋",
-    "back": "🔙",
-    "forward": "➡️",
-    "refresh": "🔄",
-}
+# Fragment API настройки [citation:2][citation:10]
+FRAGMENT_MNEMONIC = "your_24_word_seed_phrase_here"  # 24 слова сид-фразы
+FRAGMENT_COOKIES = "your_fragment_cookies"
+FRAGMENT_HASH = "your_hash_value"
+FRAGMENT_API_URL = "https://fragment.s1qwy.ru"  # API endpoint
 
 # Цены
-STAR_PRICE_RUB = 10
+STAR_PRICE_RUB = 10  # 1 звезда = 10 рублей
 STARS_PACKS = {50: 500, 100: 1000, 250: 2500, 500: 5000, 1000: 10000}
-PREMIUM_PACKS = {3: 750, 6: 1400, 12: 2500}
-REFERRAL_BONUS = 10  # Бонус за приглашённого друга
+PREMIUM_PACKS = {3: 750, 6: 1400, 12: 2500}  # months: price in stars
 
+# Эмодзи
+EMOJI = {
+    "star": "⭐", "gold_star": "🌟", "fire": "🔥", "crown": "👑",
+    "sparkles": "✨", "rocket": "🚀", "heart": "❤️", "diamond": "💎",
+    "gift": "🎁", "warning": "⚠️", "check": "✅", "cross": "❌",
+    "info": "ℹ️", "settings": "⚙️", "wallet": "💰", "users": "👥",
+    "stats": "📊", "mail": "📧", "code": "🎟️", "lock": "🔒",
+}
+
+# ================= FRAGMENT API КЛИЕНТ =================
+
+class FragmentAPI:
+    """Клиент для работы с Fragment API [citation:10]"""
+    
+    def __init__(self, mnemonic: str, cookies: str, hash_value: str, api_url: str = FRAGMENT_API_URL):
+        self.mnemonic = mnemonic
+        self.cookies = cookies
+        self.hash_value = hash_value
+        self.api_url = api_url
+        self.auth_key = None
+        self.session = requests.Session()
+    
+    def authenticate(self) -> bool:
+        """Аутентификация в Fragment API"""
+        try:
+            response = self.session.post(
+                f"{self.api_url}/auth",
+                json={
+                    "wallet_mnemonic": self.mnemonic,
+                    "cookies": self.cookies,
+                    "hash_value": self.hash_value
+                }
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("ok"):
+                    self.auth_key = data.get("auth_key")
+                    logger.info("✅ Fragment API authentication successful")
+                    return True
+            logger.error(f"❌ Fragment auth failed: {response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Fragment auth error: {e}")
+            return False
+    
+    def buy_stars(self, username: str, quantity: int, show_sender: bool = False) -> Dict:
+        """Покупка Telegram Stars через Fragment API [citation:10]"""
+        if not self.auth_key:
+            if not self.authenticate():
+                return {"ok": False, "error": "Authentication failed"}
+        
+        try:
+            response = self.session.post(
+                f"{self.api_url}/buy_stars",
+                json={
+                    "auth_key": self.auth_key,
+                    "username": username,
+                    "quantity": quantity,
+                    "show_sender": show_sender
+                }
+            )
+            return response.json()
+        except Exception as e:
+            logger.error(f"Buy stars error: {e}")
+            return {"ok": False, "error": str(e)}
+    
+    def gift_premium(self, username: str, months: int, show_sender: bool = False) -> Dict:
+        """Покупка Telegram Premium через Fragment API [citation:10]"""
+        if not self.auth_key:
+            if not self.authenticate():
+                return {"ok": False, "error": "Authentication failed"}
+        
+        try:
+            response = self.session.post(
+                f"{self.api_url}/gift_premium",
+                json={
+                    "auth_key": self.auth_key,
+                    "username": username,
+                    "months": months,
+                    "show_sender": show_sender
+                }
+            )
+            return response.json()
+        except Exception as e:
+            logger.error(f"Gift premium error: {e}")
+            return {"ok": False, "error": str(e)}
+    
+    def get_balance(self) -> Dict:
+        """Получение баланса кошелька [citation:10]"""
+        if not self.auth_key:
+            if not self.authenticate():
+                return {"ok": False, "error": "Authentication failed"}
+        
+        try:
+            response = self.session.get(
+                f"{self.api_url}/balance",
+                params={"auth_key": self.auth_key}
+            )
+            return response.json()
+        except Exception as e:
+            logger.error(f"Get balance error: {e}")
+            return {"ok": False, "error": str(e)}
+    
+    def health_check(self) -> Dict:
+        """Проверка статуса API"""
+        try:
+            response = self.session.get(f"{self.api_url}/health")
+            return response.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
 # ================= БАЗА ДАННЫХ =================
 
 def init_database():
+    """Инициализация базы данных"""
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-
-    # Пользователи (расширенная таблица)
+    
+    # Пользователи
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            last_name TEXT,
             balance INTEGER DEFAULT 0,
-            premium_until INTEGER DEFAULT 0,
             total_spent INTEGER DEFAULT 0,
-            total_earned INTEGER DEFAULT 0,
             join_date INTEGER DEFAULT 0,
-            last_active INTEGER DEFAULT 0,
-            referrer_id INTEGER DEFAULT 0,
-            referral_count INTEGER DEFAULT 0,
-            is_banned INTEGER DEFAULT 0,
-            warnings INTEGER DEFAULT 0,
-            language TEXT DEFAULT 'ru',
-            notification_settings TEXT DEFAULT '{"payments": true, "promos": true}'
+            last_active INTEGER DEFAULT 0
         )
     """)
-
+    
     # Транзакции
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
@@ -163,28 +221,28 @@ def init_database():
             payment_system TEXT,
             status TEXT DEFAULT 'pending',
             payment_id TEXT,
+            transaction_hash TEXT,
             created_at INTEGER,
             completed_at INTEGER
         )
     """)
-
+    
     # Промокоды
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS promocodes (
             code TEXT PRIMARY KEY,
             reward_stars INTEGER,
             reward_premium_days INTEGER,
-            reward_balance INTEGER,
             max_uses INTEGER,
             used_count INTEGER DEFAULT 0,
-            min_level INTEGER DEFAULT 0,
+            min_purchase INTEGER DEFAULT 0,
             is_active INTEGER DEFAULT 1,
             created_by INTEGER,
             created_at INTEGER,
             expires_at INTEGER
         )
     """)
-
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS promo_usage (
             user_id INTEGER,
@@ -193,7 +251,7 @@ def init_database():
             PRIMARY KEY (user_id, code)
         )
     """)
-
+    
     # Задания
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
@@ -203,57 +261,31 @@ def init_database():
             reward_stars INTEGER,
             task_type TEXT,
             target_id TEXT,
-            target_url TEXT,
-            required_count INTEGER DEFAULT 1,
             is_active INTEGER DEFAULT 1,
             created_by INTEGER,
-            created_at INTEGER,
-            order_index INTEGER DEFAULT 0,
-            daily_limit INTEGER DEFAULT 0,
-            daily_completed INTEGER DEFAULT 0,
-            last_reset INTEGER DEFAULT 0
+            created_at INTEGER
         )
     """)
-
-    # Выполненные задания
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS completed_tasks (
             user_id INTEGER,
             task_id INTEGER,
             completed_at INTEGER,
-            completed_count INTEGER DEFAULT 1,
             PRIMARY KEY (user_id, task_id)
         )
     """)
-
-    # Рассылки
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS mailings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_text TEXT,
-            message_type TEXT,
-            media_file_id TEXT,
-            buttons_json TEXT,
-            target_filter TEXT,
-            status TEXT,
-            total_users INTEGER,
-            sent_count INTEGER DEFAULT 0,
-            created_by INTEGER,
-            created_at INTEGER
-        )
-    """)
-
+    
     # Чёрный список
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS blacklist (
             user_id INTEGER PRIMARY KEY,
             reason TEXT,
             banned_by INTEGER,
-            banned_at INTEGER,
-            banned_until INTEGER
+            banned_at INTEGER
         )
     """)
-
+    
     # Статистика ошибок
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS error_logs (
@@ -264,44 +296,13 @@ def init_database():
             created_at INTEGER
         )
     """)
-
-    # Ежедневные бонусы
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS daily_bonus (
-            user_id INTEGER PRIMARY KEY,
-            last_claim INTEGER DEFAULT 0,
-            streak INTEGER DEFAULT 0
-        )
-    """)
-
-    # Настройки бота
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT,
-            updated_at INTEGER
-        )
-    """)
-
-    # Вставка настроек по умолчанию
-    default_settings = [
-        ('welcome_message', 'Добро пожаловать в магазин!', 0),
-        ('referral_bonus', '10', 0),
-        ('daily_bonus_base', '5', 0),
-        ('daily_bonus_multiplier', '2', 0),
-        ('maintenance_mode', '0', 0),
-        ('min_withdraw', '100', 0),
-    ]
-    cursor.executemany("INSERT OR IGNORE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)", default_settings)
-
+    
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована")
-
+    logger.info("✅ Database initialized")
 
 def get_db():
     return sqlite3.connect("bot_database.db")
-
 
 @contextmanager
 def db_transaction():
@@ -314,7 +315,6 @@ def db_transaction():
         raise
     finally:
         conn.close()
-
 
 def get_user(user_id: int) -> Dict:
     with db_transaction() as conn:
@@ -332,155 +332,166 @@ def get_user(user_id: int) -> Dict:
         columns = [desc[0] for desc in cursor.description]
         return dict(zip(columns, user))
 
-
 def update_user(user_id: int, **kwargs):
     with db_transaction() as conn:
         cursor = conn.cursor()
         for key, value in kwargs.items():
             cursor.execute(f"UPDATE users SET {key} = ? WHERE user_id = ?", (value, user_id))
 
-
 def add_stars(user_id: int, amount: int, reason: str = ""):
     with db_transaction() as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
-                       (amount, amount, user_id))
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
         if reason:
             logger.info(f"Added {amount} stars to {user_id}: {reason}")
-
-
-def remove_stars(user_id: int, amount: int) -> bool:
-    with db_transaction() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
-                       (amount, user_id, amount))
-        return cursor.rowcount > 0
-
-
-def set_premium(user_id: int, days: int):
-    with db_transaction() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT premium_until FROM users WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        current = result[0] if result else 0
-        new_until = max(current, int(time.time())) + (days * 86400)
-        cursor.execute("UPDATE users SET premium_until = ? WHERE user_id = ?", (new_until, user_id))
-
-
-def is_premium_active(user_id: int) -> bool:
-    user = get_user(user_id)
-    return user.get('premium_until', 0) > int(time.time())
-
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-
 def is_banned(user_id: int) -> bool:
     with db_transaction() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT banned_until FROM blacklist WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        if result and result[0] and result[0] > int(time.time()):
-            return True
-        cursor.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        return result and result[0] == 1
-
+        cursor.execute("SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,))
+        return cursor.fetchone() is not None
 
 def generate_order_id(user_id: int, tx_type: str) -> str:
     return f"{tx_type}_{user_id}_{int(time.time())}_{secrets.token_hex(4)}"
 
+def generate_promo_code(length: int = 8) -> str:
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(length))
 
-def get_emoji(emoji_name: str) -> str:
-    return EMOJI.get(emoji_name, "⭐")
+def get_transaction(order_id: str) -> Optional[Dict]:
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM transactions WHERE order_id = ?", (order_id,))
+        tx = cursor.fetchone()
+        if tx:
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, tx))
+        return None
 
+def update_transaction_status(order_id: str, status: str, payment_id: str = None, tx_hash: str = None):
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        if payment_id:
+            cursor.execute(
+                "UPDATE transactions SET status = ?, payment_id = ?, transaction_hash = ?, completed_at = ? WHERE order_id = ?",
+                (status, payment_id, tx_hash, int(time.time()), order_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE transactions SET status = ?, completed_at = ? WHERE order_id = ?",
+                (status, int(time.time()), order_id)
+            )
 
-def get_premium_emoji_message(text: str) -> str:
-    replacements = {
-        "⭐": f'<emoji id={PREMIUM_EMOJI_IDS["star"]}>⭐</emoji>',
-        "🔥": f'<emoji id={PREMIUM_EMOJI_IDS["fire"]}>🔥</emoji>',
-        "👑": f'<emoji id={PREMIUM_EMOJI_IDS["crown"]}>👑</emoji>',
-        "✨": f'<emoji id={PREMIUM_EMOJI_IDS["sparkles"]}>✨</emoji>',
-        "🚀": f'<emoji id={PREMIUM_EMOJI_IDS["rocket"]}>🚀</emoji>',
-        "❤️": f'<emoji id={PREMIUM_EMOJI_IDS["heart"]}>❤️</emoji>',
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
+# ================= FRAGMENT ОТПРАВКА =================
 
+fragment_client = FragmentAPI(
+    mnemonic=FRAGMENT_MNEMONIC,
+    cookies=FRAGMENT_COOKIES,
+    hash_value=FRAGMENT_HASH
+)
 
-# ================= FRAGMENT API =================
-
-try:
-    from pyfragment import FragmentClient, UserNotFoundError, WalletError
-
-    PYFRAGMENT_AVAILABLE = True
-except ImportError:
-    PYFRAGMENT_AVAILABLE = False
-
-
-async def send_stars_via_fragment(username: str, amount: int) -> Tuple[bool, str]:
-    if not PYFRAGMENT_AVAILABLE:
-        return False, "pyfragment не установлен"
+async def send_stars_to_user(username: str, amount: int) -> Tuple[bool, str]:
+    """Отправка звезд пользователю через Fragment API [citation:2][citation:10]"""
+    if not username.startswith('@'):
+        username = f"@{username}"
+    
     try:
-        async with FragmentClient(
-                seed=FRAGMENT_SEED,
-                api_key=FRAGMENT_API_KEY,
-                cookies=FRAGMENT_COOKIES,
-        ) as client:
-            result = await client.purchase_stars(username, amount=amount)
-            return True, result.transaction_id
+        # Проверка баланса перед покупкой
+        balance = fragment_client.get_balance()
+        if not balance.get('ok'):
+            return False, f"Fragment API error: {balance.get('error')}"
+        
+        # Покупка звезд
+        result = fragment_client.buy_stars(username, quantity=amount, show_sender=False)
+        
+        if result.get('ok'):
+            tx_hash = result.get('transaction_hash', 'unknown')
+            logger.info(f"Stars sent: {amount} to {username}, tx: {tx_hash}")
+            return True, tx_hash
+        else:
+            return False, result.get('error', 'Unknown error')
     except Exception as e:
+        logger.error(f"Send stars error: {e}")
         return False, str(e)
 
-
-async def send_premium_via_fragment(username: str, months: int) -> Tuple[bool, str]:
-    if not PYFRAGMENT_AVAILABLE:
-        return False, "pyfragment не установлен"
+async def send_premium_to_user(username: str, months: int) -> Tuple[bool, str]:
+    """Отправка Premium пользователю через Fragment API [citation:2][citation:10]"""
+    if not username.startswith('@'):
+        username = f"@{username}"
+    
     try:
-        async with FragmentClient(
-                seed=FRAGMENT_SEED,
-                api_key=FRAGMENT_API_KEY,
-                cookies=FRAGMENT_COOKIES,
-        ) as client:
-            result = await client.purchase_premium(username, months=months)
-            return True, result.transaction_id
+        # Проверка баланса
+        balance = fragment_client.get_balance()
+        if not balance.get('ok'):
+            return False, f"Fragment API error: {balance.get('error')}"
+        
+        # Покупка Premium
+        result = fragment_client.gift_premium(username, months=months, show_sender=False)
+        
+        if result.get('ok'):
+            tx_hash = result.get('transaction_hash', 'unknown')
+            logger.info(f"Premium sent: {months} months to {username}, tx: {tx_hash}")
+            return True, tx_hash
+        else:
+            # Обработка ошибок Fragment API
+            error_msg = result.get('error', 'Unknown error')
+            if 'insufficient' in error_msg.lower():
+                error_msg = "Недостаточно средств на кошельке Fragment"
+            return False, error_msg
     except Exception as e:
+        logger.error(f"Send premium error: {e}")
         return False, str(e)
-
 
 # ================= ПЛАТЕЖНЫЕ СИСТЕМЫ =================
 
 class CryptoBotClient:
+    """Клиент для работы с CryptoBot API"""
+    
     def __init__(self, token: str):
         self.token = token
-        self.headers = {"Crypto-Pay-API-Token": token, "Content-Type": "application/json"}
-
+        self.headers = {"Crypto-Pay-API-Token": token, "Content-Type":application/json"}
+    
     async def create_invoice(self, amount: float, description: str = "") -> Optional[Dict]:
+        """Создание счёта в CryptoBot"""
         async with aiohttp.ClientSession() as session:
             data = {"asset": "RUB", "amount": str(amount), "description": description}
             try:
                 async with session.post(f"{CRYPTOBOT_API_URL}/createInvoice", headers=self.headers, json=data) as resp:
                     result = await resp.json()
                     if result.get("ok"):
-                        return {"invoice_id": result["result"]["invoice_id"], "pay_url": result["result"]["pay_url"]}
+                        return {
+                            "invoice_id": result["result"]["invoice_id"],
+                            "pay_url": result["result"]["pay_url"]
+                        }
+                    logger.error(f"CryptoBot error: {result}")
+                    return None
             except Exception as e:
                 logger.error(f"CryptoBot error: {e}")
-            return None
-
+                return None
+    
+    @staticmethod
+    def verify_webhook(data: bytes, signature: str, token: str) -> bool:
+        """Проверка подписи вебхука CryptoBot"""
+        secret = hashlib.sha256(token.encode()).digest()
+        computed = hmac.new(secret, data, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(computed, signature)
 
 class PlategaClient:
+    """Клиент для работы с Platega.io API"""
+    
     def __init__(self, merchant_id: str, secret_key: str):
         self.merchant_id = merchant_id
         self.secret_key = secret_key
-
+    
     async def create_transaction(self, amount: float, order_id: str, description: str = "") -> Optional[Dict]:
+        """Создание транзакции в Platega"""
         async with aiohttp.ClientSession() as session:
             timestamp = int(time.time())
             sign_str = f"{self.merchant_id}{order_id}{amount}{timestamp}{self.secret_key}"
             signature = hashlib.md5(sign_str.encode()).hexdigest()
-
+            
             data = {
                 "merchant_id": self.merchant_id,
                 "amount": amount,
@@ -490,1416 +501,1383 @@ class PlategaClient:
                 "signature": signature,
                 "currency": "RUB",
             }
-
+            
             try:
                 async with session.post(f"{PLATEGA_API_URL}/create", json=data) as resp:
                     result = await resp.json()
                     if result.get("status") == "success":
-                        return {"transaction_id": result["transaction_id"], "payment_url": result["payment_url"]}
+                        return {
+                            "transaction_id": result["transaction_id"],
+                            "payment_url": result["payment_url"]
+                        }
+                    logger.error(f"Platega error: {result}")
+                    return None
             except Exception as e:
                 logger.error(f"Platega error: {e}")
-            return None
-
+                return None
 
 cryptobot = CryptoBotClient(CRYPTOBOT_TOKEN)
 platega = PlategaClient(PLATEGA_MERCHANT_ID, PLATEGA_SECRET_KEY)
 
-
-# ================= ПРОВЕРКИ ЗАДАНИЙ =================
-
-async def check_channel_subscription(client: Client, user_id: int, channel_username: str) -> bool:
-    try:
-        member = await client.get_chat_member(f"@{channel_username}", user_id)
-        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
-    except:
-        return False
-
-
-async def check_group_join(client: Client, user_id: int, group_username: str) -> bool:
-    try:
-        member = await client.get_chat_member(f"@{group_username}", user_id)
-        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
-    except:
-        return False
-
-
-async def check_bot_start(bot_username: str, user_id: int) -> bool:
-    # Требуется deep linking реализация
-    return True
-
-
 # ================= КЛАВИАТУРЫ =================
 
 def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Главное меню - только кабинет"""
+    """Главная клавиатура"""
     buttons = [
-        [InlineKeyboardButton(f"{get_emoji('wallet')} Мой кошелек", callback_data="my_wallet")],
-        [InlineKeyboardButton(f"{get_emoji('sparkles')} Магазин", callback_data="shop_menu")],
-        [InlineKeyboardButton(f"{get_emoji('rocket')} Задания", callback_data="tasks_menu")],
-        [InlineKeyboardButton(f"{get_emoji('gift')} Ежедневный бонус", callback_data="daily_bonus")],
-        [InlineKeyboardButton(f"{get_emoji('users')} Реферальная система", callback_data="referral_menu")],
-        [InlineKeyboardButton(f"{get_emoji('info')} О боте", callback_data="about_menu")],
+        [InlineKeyboardButton(f"{EMOJI['star']} Купить звезды", callback_data="buy_stars_menu")],
+        [InlineKeyboardButton(f"{EMOJI['crown']} Купить Premium", callback_data="buy_premium_menu")],
+        [InlineKeyboardButton(f"{EMOJI['wallet']} Мой баланс", callback_data="my_balance")],
+        [InlineKeyboardButton(f"{EMOJI['rocket']} Задания", callback_data="tasks_menu")],
+        [InlineKeyboardButton(f"{EMOJI['gift']} Промокод", callback_data="activate_promo")],
+        [InlineKeyboardButton(f"{EMOJI['info']} О боте", callback_data="about")],
     ]
     if is_admin(user_id):
-        buttons.append([InlineKeyboardButton(f"{get_emoji('settings')} Админ панель", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton(f"{EMOJI['settings']} Админ панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(buttons)
 
-
-def get_wallet_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура кошелька"""
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    """Админ панель"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{get_emoji('plus')} Пополнить баланс", callback_data="deposit_menu")],
-        [InlineKeyboardButton(f"{get_emoji('gift')} Активировать промокод", callback_data="activate_promo")],
-        [InlineKeyboardButton(f"{get_emoji('crown')} Купить Premium", callback_data="buy_premium_menu")],
-        [InlineKeyboardButton(f"{get_emoji('refresh')} История операций", callback_data="transaction_history")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="back_to_main")]
+        [InlineKeyboardButton(f"{EMOJI['stats']} Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(f"{EMOJI['mail']} Рассылка", callback_data="admin_mailing")],
+        [InlineKeyboardButton(f"{EMOJI['code']} Промокоды", callback_data="admin_promocodes")],
+        [InlineKeyboardButton(f"{EMOJI['rocket']} Задания", callback_data="admin_tasks")],
+        [InlineKeyboardButton(f"{EMOJI['star']} Выдать звезды", callback_data="admin_give_stars")],
+        [InlineKeyboardButton(f"{EMOJI['crown']} Выдать Premium", callback_data="admin_give_premium")],
+        [InlineKeyboardButton(f"{EMOJI['users']} Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton(f"{EMOJI['lock']} Чёрный список", callback_data="admin_blacklist")],
+        [InlineKeyboardButton(f"{EMOJI['diamond']} Баланс Fragment", callback_data="admin_fragment_balance")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
     ])
 
+def get_stars_keyboard() -> InlineKeyboardMarkup:
+    """Выбор количества звезд"""
+    buttons = []
+    for stars, price in STARS_PACKS.items():
+        buttons.append([InlineKeyboardButton(f"{EMOJI['star']} {stars} ⭐ ({price} ₽)", callback_data=f"buy_stars:{stars}:{price}")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(buttons)
 
-def get_deposit_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{get_emoji('star')} 50 ⭐ (500 ₽)", callback_data="deposit:50:500")],
-        [InlineKeyboardButton(f"{get_emoji('star')} 100 ⭐ (1000 ₽)", callback_data="deposit:100:1000")],
-        [InlineKeyboardButton(f"{get_emoji('star')} 250 ⭐ (2500 ₽)", callback_data="deposit:250:2500")],
-        [InlineKeyboardButton(f"{get_emoji('star')} 500 ⭐ (5000 ₽)", callback_data="deposit:500:5000")],
-        [InlineKeyboardButton(f"{get_emoji('star')} 1000 ⭐ (10000 ₽)", callback_data="deposit:1000:10000")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="my_wallet")]
-    ])
+def get_premium_keyboard() -> InlineKeyboardMarkup:
+    """Выбор Premium подписки"""
+    buttons = []
+    for months, price in PREMIUM_PACKS.items():
+        discount = " -10%" if months == 6 else " -20%" if months == 12 else ""
+        buttons.append([InlineKeyboardButton(f"{EMOJI['crown']} {months} мес. ({price} ⭐){discount}", callback_data=f"buy_premium:{months}:{price}")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(buttons)
 
-
-def get_payment_method_keyboard(order_id: str, amount: int, product_type: str) -> InlineKeyboardMarkup:
+def get_payment_keyboard(order_id: str, amount: int, product_type: str) -> InlineKeyboardMarkup:
+    """Выбор способа оплаты"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🤖 CryptoBot", callback_data=f"pay:cryptobot:{order_id}:{amount}:{product_type}")],
         [InlineKeyboardButton("💳 Platega.io", callback_data=f"pay:platega:{order_id}:{amount}:{product_type}")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="deposit_menu")]
+        [InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_{product_type}")]
     ])
 
+# ================= ОБРАБОТКА ПЛАТЕЖЕЙ =================
 
-def get_admin_main_keyboard() -> InlineKeyboardMarkup:
-    """Главная админ-панель"""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{get_emoji('users')} Управление пользователями", callback_data="admin_users_menu")],
-        [InlineKeyboardButton(f"{get_emoji('stats')} Статистика и аналитика", callback_data="admin_stats_menu")],
-        [InlineKeyboardButton(f"{get_emoji('mail')} Рассылки", callback_data="admin_mailing_menu")],
-        [InlineKeyboardButton(f"{get_emoji('code')} Промокоды", callback_data="admin_promocodes_menu")],
-        [InlineKeyboardButton(f"{get_emoji('rocket')} Задания", callback_data="admin_tasks_menu")],
-        [InlineKeyboardButton(f"{get_emoji('settings')} Настройки бота", callback_data="admin_settings_menu")],
-        [InlineKeyboardButton(f"{get_emoji('diamond')} Финансы", callback_data="admin_finance_menu")],
-        [InlineKeyboardButton(f"{get_emoji('lock')} Безопасность", callback_data="admin_security_menu")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="back_to_main")]
-    ])
-
-
-def get_admin_users_keyboard(page: int = 0) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Общая статистика", callback_data="admin_user_stats")],
-        [InlineKeyboardButton("🔍 Поиск пользователя", callback_data="admin_search_user")],
-        [InlineKeyboardButton("⭐ Выдать звезды", callback_data="admin_give_stars")],
-        [InlineKeyboardButton("👑 Выдать Premium", callback_data="admin_give_premium")],
-        [InlineKeyboardButton("⚠️ Заблокировать", callback_data="admin_ban_user")],
-        [InlineKeyboardButton("✅ Разблокировать", callback_data="admin_unban_user")],
-        [InlineKeyboardButton("📈 Топ пользователей", callback_data="admin_top_users")],
-        [InlineKeyboardButton("📋 Активные премиум", callback_data="admin_premium_users")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_admin_stats_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Общая статистика", callback_data="admin_general_stats")],
-        [InlineKeyboardButton("💰 Финансовая статистика", callback_data="admin_finance_stats")],
-        [InlineKeyboardButton("📈 Графики", callback_data="admin_charts")],
-        [InlineKeyboardButton("🎯 Активность заданий", callback_data="admin_tasks_stats")],
-        [InlineKeyboardButton("💎 Продажи Premium", callback_data="admin_premium_sales")],
-        [InlineKeyboardButton("⚡ Ежедневная активность", callback_data="admin_daily_activity")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_admin_mailing_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Новая рассылка", callback_data="admin_new_mailing")],
-        [InlineKeyboardButton("📋 История рассылок", callback_data="admin_mailing_history")],
-        [InlineKeyboardButton("⏹️ Остановить рассылку", callback_data="admin_stop_mailing")],
-        [InlineKeyboardButton("🎯 Рассылка по фильтрам", callback_data="admin_filtered_mailing")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_admin_promocodes_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Создать промокод", callback_data="admin_create_promo")],
-        [InlineKeyboardButton("📋 Список промокодов", callback_data="admin_list_promocodes")],
-        [InlineKeyboardButton("🗑️ Удалить промокод", callback_data="admin_delete_promo")],
-        [InlineKeyboardButton("📊 Статистика промокодов", callback_data="admin_promo_stats")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_admin_tasks_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Создать задание", callback_data="admin_create_task")],
-        [InlineKeyboardButton("📋 Список заданий", callback_data="admin_tasks_list")],
-        [InlineKeyboardButton("✏️ Редактировать задание", callback_data="admin_edit_task")],
-        [InlineKeyboardButton("🗑️ Удалить задание", callback_data="admin_delete_task")],
-        [InlineKeyboardButton("🔄 Сбросить статистику", callback_data="admin_reset_tasks")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_admin_settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Приветственное сообщение", callback_data="admin_set_welcome")],
-        [InlineKeyboardButton("⭐ Реферальный бонус", callback_data="admin_set_referral")],
-        [InlineKeyboardButton("🎁 Ежедневный бонус", callback_data="admin_set_daily")],
-        [InlineKeyboardButton("💱 Курс звезд", callback_data="admin_set_star_price")],
-        [InlineKeyboardButton("🔧 Режим обслуживания", callback_data="admin_maintenance")],
-        [InlineKeyboardButton("📢 Системное сообщение", callback_data="admin_system_msg")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_admin_finance_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Баланс бота", callback_data="admin_bot_balance")],
-        [InlineKeyboardButton("📊 Вывод средств", callback_data="admin_withdraw_stats")],
-        [InlineKeyboardButton("⚙️ Настройки платежей", callback_data="admin_payment_settings")],
-        [InlineKeyboardButton("📈 Отчет по транзакциям", callback_data="admin_transaction_report")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_admin_security_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚫 Чёрный список", callback_data="admin_blacklist")],
-        [InlineKeyboardButton("⚠️ Жалобы пользователей", callback_data="admin_reports")],
-        [InlineKeyboardButton("📜 Логи ошибок", callback_data="admin_error_logs")],
-        [InlineKeyboardButton("🔐 Сменить токен бота", callback_data="admin_change_token")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="admin_panel")]
-    ])
-
-
-def get_referral_keyboard(user_id: int, referral_code: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Пригласить друга", callback_data="invite_friend")],
-        [InlineKeyboardButton("👥 Мои рефералы", callback_data="my_referrals")],
-        [InlineKeyboardButton("🎁 Бонусы", callback_data="referral_bonuses")],
-        [InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="back_to_main")]
-    ])
-
-
-# ================= WEBHOOK СЕРВЕР =================
-
-bot_instance = None
-
-
-async def process_payment(order_id: str, payment_system: str, payment_id: str):
-    with db_transaction() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM transactions WHERE order_id = ?", (order_id,))
-        tx = cursor.fetchone()
-
-        if not tx or tx[7] == 'completed':
-            return
-
-        user_id = tx[1]
-        stars_amount = tx[4]
-        premium_months = tx[5]
-
-        try:
-            user_info = await bot_instance.get_users(user_id)
-            username = user_info.username
-            if not username:
-                return
-        except:
-            return
-
-        if stars_amount and stars_amount > 0:
-            success, result = await send_stars_via_fragment(f"@{username}", stars_amount)
-            if success:
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (stars_amount, user_id))
-                cursor.execute(
-                    "UPDATE transactions SET status = 'completed', payment_id = ?, completed_at = ? WHERE order_id = ?",
-                    (payment_id, int(time.time()), order_id))
-                await bot_instance.send_message(
-                    user_id,
-                    get_premium_emoji_message(
-                        f"✅ *Оплата подтверждена!*\n\n"
-                        f"{get_emoji('star')} {stars_amount} Telegram Stars отправлено!\n"
-                        f"Transaction ID: `{result}`"
-                    ),
-                    parse_mode=ParseMode.HTML
-                )
-        elif premium_months and premium_months > 0:
-            success, result = await send_premium_via_fragment(f"@{username}", premium_months)
-            if success:
-                cursor.execute("SELECT premium_until FROM users WHERE user_id = ?", (user_id,))
-                current = cursor.fetchone()[0] or 0
-                new_until = max(current, int(time.time())) + (premium_months * 30 * 86400)
-                cursor.execute("UPDATE users SET premium_until = ? WHERE user_id = ?", (new_until, user_id))
-                cursor.execute(
-                    "UPDATE transactions SET status = 'completed', payment_id = ?, completed_at = ? WHERE order_id = ?",
-                    (payment_id, int(time.time()), order_id))
-                await bot_instance.send_message(
-                    user_id,
-                    get_premium_emoji_message(
-                        f"✅ *Оплата подтверждена!*\n\n"
-                        f"{get_emoji('crown')} Premium на {premium_months} месяцев активирован!"
-                    ),
-                    parse_mode=ParseMode.HTML
-                )
-
-
-async def cryptobot_webhook(request):
+async def process_successful_payment(order_id: str, payment_system: str, payment_id: str, app: Application):
+    """Обработка успешного платежа - отправка товара через Fragment"""
+    tx = get_transaction(order_id)
+    if not tx:
+        logger.error(f"Transaction {order_id} not found")
+        return False
+    
+    if tx['status'] == 'completed':
+        logger.info(f"Transaction {order_id} already processed")
+        return True
+    
+    user_id = tx['user_id']
+    
+    # Получаем username пользователя
     try:
-        data = await request.json()
-        if data.get("update_type") == "invoice_paid":
-            payload = data.get("payload", {})
-            order_id = payload.get("description", "")
-            invoice_id = str(payload.get("invoice_id", ""))
+        user_info = await app.bot.get_chat(user_id)
+        username = user_info.username
+        if not username:
+            await app.bot.send_message(user_id, "❌ Установите username в Telegram для получения товара!")
+            return False
+    except Exception as e:
+        logger.error(f"Error getting username: {e}")
+        return False
+    
+    success = False
+    tx_hash = ""
+    
+    # Отправка звезд через Fragment
+    if tx.get('stars_amount') and tx['stars_amount'] > 0:
+        success, tx_hash = await send_stars_to_user(username, tx['stars_amount'])
+        if success:
+            add_stars(user_id, tx['stars_amount'], f"Purchase {tx['stars_amount']} stars")
+            update_transaction_status(order_id, 'completed', payment_id, tx_hash)
+            
+            await app.bot.send_message(
+                user_id,
+                f"✅ *Оплата подтверждена!*\n\n"
+                f"{EMOJI['star']} {tx['stars_amount']} Telegram Stars отправлено!\n"
+                f"Transaction: `{tx_hash}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return True
+    
+    # Отправка Premium через Fragment
+    elif tx.get('premium_months') and tx['premium_months'] > 0:
+        success, tx_hash = await send_premium_to_user(username, tx['premium_months'])
+        if success:
+            update_transaction_status(order_id, 'completed', payment_id, tx_hash)
+            
+            await app.bot.send_message(
+                user_id,
+                f"✅ *Оплата подтверждена!*\n\n"
+                f"{EMOJI['crown']} Telegram Premium на {tx['premium_months']} месяцев активирован!\n"
+                f"Transaction: `{tx_hash}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return True
+    
+    if not success:
+        logger.error(f"Failed to deliver product: {tx_hash}")
+        await app.bot.send_message(
+            user_id,
+            f"❌ *Ошибка выдачи товара*\n\n{tx_hash}\nОбратитесь в поддержку.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    return success
+
+# ================= FLASK WEBHOOK СЕРВЕР =================
+
+flask_app = Flask(__name__)
+bot_application = None
+
+@flask_app.route('/webhook/cryptobot', methods=['POST'])
+def cryptobot_webhook():
+    """Обработчик вебхука CryptoBot"""
+    try:
+        signature = request.headers.get('Crypto-Pay-API-Signature', '')
+        body = request.get_data()
+        
+        if not cryptobot.verify_webhook(body, signature, CRYPTOBOT_TOKEN):
+            return jsonify({"error": "Invalid signature"}), 401
+        
+        data = request.json
+        logger.info(f"CryptoBot webhook: {data}")
+        
+        if data.get('update_type') == 'invoice_paid':
+            payload = data.get('payload', {})
+            order_id = payload.get('description', '')
+            invoice_id = str(payload.get('invoice_id', ''))
+            
             if order_id and invoice_id:
-                await process_payment(order_id, "cryptobot", invoice_id)
-        return web.json_response({"ok": True})
+                asyncio.run_coroutine_threadsafe(
+                    process_successful_payment(order_id, 'cryptobot', invoice_id, bot_application),
+                    bot_application.loop
+                )
+        
+        return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"CryptoBot webhook error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        return jsonify({"error": str(e)}), 500
 
-
-async def platega_webhook(request):
+@flask_app.route('/webhook/platega', methods=['POST'])
+def platega_webhook():
+    """Обработчик вебхука Platega.io"""
     try:
-        data = await request.json()
-        if data.get("event") == "transaction.completed":
-            order_id = data.get("order_id", "")
-            transaction_id = data.get("transaction_id", "")
+        data = request.json
+        logger.info(f"Platega webhook: {data}")
+        
+        if data.get('event') == 'transaction.completed':
+            order_id = data.get('order_id', '')
+            transaction_id = data.get('transaction_id', '')
+            
             if order_id and transaction_id:
-                await process_payment(order_id, "platega", transaction_id)
-        return web.json_response({"ok": True})
+                asyncio.run_coroutine_threadsafe(
+                    process_successful_payment(order_id, 'platega', transaction_id, bot_application),
+                    bot_application.loop
+                )
+        
+        return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"Platega webhook error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        return jsonify({"error": str(e)}), 500
 
+@flask_app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({"status": "ok", "timestamp": int(time.time())})
 
-web_app = web.Application()
-web_app.router.add_post("/webhook/cryptobot", cryptobot_webhook)
-web_app.router.add_post("/webhook/platega", platega_webhook)
+def run_webhook_server():
+    """Запуск Flask сервера для вебхуков"""
+    flask_app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
 
+# ================= ОСНОВНОЙ БОТ (TELEGRAM) =================
 
-async def run_webhook():
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
-    await site.start()
-    logger.info(f"Webhook server started on port {WEBHOOK_PORT}")
-
-
-# ================= ОСНОВНОЙ БОТ =================
-
-app = Client("stars_premium_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-waiting_for = {}
-
-
-# ===== КОМАНДЫ =====
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(client: Client, message: Message):
-    user_id = message.from_user.id
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
     if is_banned(user_id):
-        await message.reply("🚫 Вы заблокированы!")
+        await update.message.reply_text("🚫 Вы заблокированы!")
         return
-
+    
     user = get_user(user_id)
     update_user(user_id,
-                username=message.from_user.username or "",
-                first_name=message.from_user.first_name or "",
+                username=update.effective_user.username or "",
+                first_name=update.effective_user.first_name or "",
                 last_active=int(time.time()))
-
-    # Обработка реферальной ссылки
-    args = message.text.split()
-    if len(args) > 1 and args[1].startswith("ref_"):
-        referrer_id = int(args[1].replace("ref_", ""))
-        if referrer_id != user_id and not user.get('referrer_id'):
-            update_user(user_id, referrer_id=referrer_id)
-            add_stars(referrer_id, REFERRAL_BONUS, f"Реферал {user_id}")
-            update_user(referrer_id, referral_count=user.get('referral_count', 0) + 1)
-
+    
     welcome_text = f"""
-{get_emoji('star')}{get_emoji('crown')} *Добро пожаловать в магазин Stars & Premium!* {get_emoji('crown')}{get_emoji('star')}
+{EMOJI['star']}{EMOJI['crown']} *Добро пожаловать в магазин Stars & Premium!* {EMOJI['crown']}{EMOJI['star']}
 
-{get_emoji('wallet')} *Ваш баланс:* {user['balance']} ⭐
+{EMOJI['wallet']} *Ваш баланс:* {user['balance']} ⭐
 
-{get_emoji('info')} Для пополнения баланса и активации промокодов используйте кнопки ниже.
+{EMOJI['rocket']} Покупайте Telegram Stars и Premium с автовыдачей!
+{EMOJI['diamond']} Оплата через CryptoBot и Platega.io
+{EMOJI['sparkles']} Мгновенная доставка через Fragment API
 
-💎 *Преимущества:*
-• Мгновенная выдача товара
-• Поддержка 24/7
-• Реферальная программа
-• Ежедневные бонусы
+Используйте кнопки ниже для навигации!
 """
-
-    await message.reply_text(
-        get_premium_emoji_message(welcome_text),
+    
+    await update.message.reply_text(
+        welcome_text,
         reply_markup=get_main_keyboard(user_id),
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.MARKDOWN
     )
 
+async def my_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать баланс пользователя"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    text = f"""
+{EMOJI['wallet']} *МОЙ БАЛАНС* {EMOJI['wallet']}
 
-@app.on_message(filters.command("admin") & filters.private)
-async def admin_command(client: Client, message: Message):
-    if is_admin(message.from_user.id):
-        await message.reply_text(
-            get_premium_emoji_message(f"{get_emoji('settings')} *Админ панель* {get_emoji('settings')}"),
-            reply_markup=get_admin_main_keyboard(),
-            parse_mode=ParseMode.HTML
+{EMOJI['star']} *Звезд:* {user['balance']} ⭐
+{EMOJI['diamond']} *Всего потрачено:* {user['total_spent']} ₽
+{EMOJI['gift']} *Дата регистрации:* {datetime.fromtimestamp(user['join_date']).strftime('%d.%m.%Y')}
+
+{EMOJI['info']} Пополнить баланс можно через Магазин → Купить звезды
+"""
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def buy_stars_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню покупки звезд"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        f"{EMOJI['star']} *Выберите количество Telegram Stars:* {EMOJI['star']}",
+        reply_markup=get_stars_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def buy_premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню покупки Premium"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        f"{EMOJI['crown']} *Выберите период Premium подписки:* {EMOJI['crown']}\n\n"
+        f"💎 *Преимущества Premium:*\n"
+        f"• {EMOJI['sparkles']} Эксклюзивные эмодзи и стикеры\n"
+        f"• {EMOJI['rocket']} Ускоренная загрузка медиа\n"
+        f"• {EMOJI['heart']} Приоритет в чатах\n"
+        f"• {EMOJI['gift']} Ежемесячные бонусы\n\n"
+        f"Оплата происходит звездами с вашего баланса!",
+        reply_markup=get_premium_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def buy_stars_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка покупки звезд"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    _, stars, price = data.split(":")
+    stars, price = int(stars), int(price)
+    
+    order_id = generate_order_id(query.from_user.id, "stars")
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO transactions (user_id, order_id, amount_rub, stars_amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (query.from_user.id, order_id, price, stars, "pending", int(time.time()))
+        )
+    
+    await query.edit_message_text(
+        f"{EMOJI['star']} *{stars} звезд*\nСумма: {price} ₽\n\n"
+        f"Выберите способ оплаты:",
+        reply_markup=get_payment_keyboard(order_id, price, "stars"),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def buy_premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка покупки Premium (за звезды с баланса)"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    _, months, stars_price = data.split(":")
+    months, stars_price = int(months), int(stars_price)
+    
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    if user['balance'] < stars_price:
+        await query.answer(f"❌ Недостаточно звезд! Нужно: {stars_price}", show_alert=True)
+        return
+    
+    await query.edit_message_text(
+        f"{EMOJI['rocket']} *Оформление Premium...*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    username = query.from_user.username
+    if not username:
+        await query.edit_message_text(
+            "❌ *Установите username в Telegram!*\n\n"
+            "Перейдите в Настройки → username и установите имя пользователя.",
+            reply_markup=get_main_keyboard(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Отправка Premium через Fragment
+    success, tx_hash = await send_premium_to_user(username, months)
+    
+    if success:
+        # Списание звезд
+        with db_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (stars_price, user_id))
+            cursor.execute(
+                "INSERT INTO transactions (user_id, order_id, amount_rub, premium_months, status, transaction_hash, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, f"premium_{user_id}_{int(time.time())}", stars_price, months, "completed", tx_hash, int(time.time()))
+            )
+        
+        await query.edit_message_text(
+            f"✅ *Premium на {months} месяцев успешно активирован!*\n\n"
+            f"{EMOJI['star']} Списано: {stars_price} ⭐\n"
+            f"{EMOJI['crown']} Premium активирован!\n"
+            f"Transaction: `{tx_hash}`",
+            reply_markup=get_main_keyboard(user_id),
+            parse_mode=ParseMode.MARKDOWN
         )
     else:
-        await message.reply_text("⛔ Доступ запрещён!")
-
-
-# ===== CALLBACK ОБРАБОТЧИКИ =====
-
-@app.on_callback_query()
-async def handle_callback(client: Client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    data = callback.data
-
-    if is_banned(user_id):
-        await callback.answer("🚫 Вы заблокированы!", show_alert=True)
-        return
-
-    # === НАВИГАЦИЯ ===
-
-    if data == "back_to_main":
-        user = get_user(user_id)
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('star')} *Главное меню* {get_emoji('star')}\n\n"
-                f"{get_emoji('wallet')} Баланс: {user['balance']} ⭐"
-            ),
+        await query.edit_message_text(
+            f"❌ *Ошибка активации Premium*\n\n{tx_hash}",
             reply_markup=get_main_keyboard(user_id),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data == "admin_panel" and is_admin(user_id):
-        await callback.message.edit_text(
-            get_premium_emoji_message(f"{get_emoji('settings')} *Панель администратора* {get_emoji('settings')}"),
-            reply_markup=get_admin_main_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === МОЙ КОШЕЛЕК ===
-
-    if data == "my_wallet":
-        user = get_user(user_id)
-        premium_status = "✅" if is_premium_active(user_id) else "❌"
-        text = f"""
-{get_emoji('wallet')} *МОЙ КОШЕЛЕК* {get_emoji('wallet')}
-
-{get_emoji('star')} *Баланс:* {user['balance']} ⭐
-{get_emoji('crown')} *Premium:* {premium_status}
-{get_emoji('diamond')} *Всего потрачено:* {user['total_spent']} ₽
-{get_emoji('gift')} *Заработано:* {user['total_earned']} ⭐
-{get_emoji('users')} *Приглашено:* {user['referral_count']}
-
-💡 *Как пополнить:*
-Выберите сумму и способ оплаты. Товар придёт автоматически.
-"""
-        await callback.message.edit_text(
-            get_premium_emoji_message(text),
-            reply_markup=get_wallet_keyboard(user_id),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === ПОПОЛНЕНИЕ БАЛАНСА ===
-
-    if data == "deposit_menu":
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('plus')} *Пополнение баланса* {get_emoji('plus')}\n\n"
-                f"Выберите количество звезд:"
-            ),
-            reply_markup=get_deposit_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data.startswith("deposit:"):
-        _, stars, price = data.split(":")
-        stars, price = int(stars), int(price)
-        order_id = generate_order_id(user_id, "stars")
-
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO transactions (user_id, order_id, amount_rub, stars_amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, order_id, price, stars, "pending", int(time.time()))
-            )
-
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('star')} *{stars} звезд*\n"
-                f"Сумма: {price} ₽\n\n"
-                f"Выберите способ оплаты:"
-            ),
-            reply_markup=get_payment_method_keyboard(order_id, price, "stars"),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === ОПЛАТА ===
-
-    if data.startswith("pay:"):
-        _, payment_system, order_id, amount, product_type = data.split(":")
-        amount = int(amount)
-
-        await callback.message.edit_text(
-            get_premium_emoji_message(f"{get_emoji('rocket')} *Создание платежа...*"),
-            parse_mode=ParseMode.HTML
-        )
-
-        if payment_system == "cryptobot":
-            invoice = await cryptobot.create_invoice(amount, order_id)
-            if invoice:
-                await callback.message.edit_text(
-                    get_premium_emoji_message(
-                        f"💳 *Оплата через CryptoBot*\n\n"
-                        f"Сумма: {amount} ₽\n\n"
-                        f"🔗 [Нажмите для оплаты]({invoice['pay_url']})\n\n"
-                        f"{get_emoji('info')} После оплаты товар придет автоматически."
-                    ),
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔗 Оплатить", url=invoice['pay_url'])],
-                        [InlineKeyboardButton("🔙 Назад", callback_data="deposit_menu")]
-                    ]),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-            else:
-                await callback.message.edit_text("❌ Ошибка создания платежа", reply_markup=get_deposit_keyboard())
-
-        elif payment_system == "platega":
-            invoice = await platega.create_transaction(amount, order_id, f"Покупка {product_type}")
-            if invoice:
-                await callback.message.edit_text(
-                    get_premium_emoji_message(
-                        f"💳 *Оплата через Platega.io*\n\n"
-                        f"Сумма: {amount} ₽\n\n"
-                        f"🔗 [Нажмите для оплаты]({invoice['payment_url']})\n\n"
-                        f"{get_emoji('info')} После оплаты товар придет автоматически."
-                    ),
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔗 Оплатить", url=invoice['payment_url'])],
-                        [InlineKeyboardButton("🔙 Назад", callback_data="deposit_menu")]
-                    ]),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-            else:
-                await callback.message.edit_text("❌ Ошибка создания платежа", reply_markup=get_deposit_keyboard())
-
-        await callback.answer()
-        return
-
-    # === ПОКУПКА PREMIUM ===
-
-    if data == "buy_premium_menu":
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('crown')} *Premium подписка* {get_emoji('crown')}\n\n"
-                f"Преимущества Premium:\n"
-                f"• {get_emoji('sparkles')} Эксклюзивные эмодзи\n"
-                f"• {get_emoji('rocket')} Приоритетная поддержка\n"
-                f"• {get_emoji('gift')} Ежемесячные бонусы\n\n"
-                f"Оплата звездами с баланса:"
-            ),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("3 мес. (750 ⭐)", callback_data="buy_premium:3:750")],
-                [InlineKeyboardButton("6 мес. (1400 ⭐)", callback_data="buy_premium:6:1400")],
-                [InlineKeyboardButton("12 мес. (2500 ⭐)", callback_data="buy_premium:12:2500")],
-                [InlineKeyboardButton("🔙 Назад", callback_data="my_wallet")]
-            ]),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data.startswith("buy_premium:"):
-        _, months, stars_price = data.split(":")
-        months, stars_price = int(months), int(stars_price)
-
-        user = get_user(user_id)
-        if user['balance'] < stars_price:
-            await callback.answer(f"❌ Недостаточно звезд! Нужно: {stars_price}", show_alert=True)
-            return
-
-        username = callback.from_user.username
-        if not username:
-            await callback.answer("❌ Установите username в Telegram!", show_alert=True)
-            return
-
-        await callback.message.edit_text(
-            get_premium_emoji_message(f"{get_emoji('rocket')} *Оформление Premium...*"),
-            parse_mode=ParseMode.HTML
-        )
-
-        success, result = await send_premium_via_fragment(f"@{username}", months)
-
-        if success:
-            remove_stars(user_id, stars_price)
-            set_premium(user_id, months * 30)
-
-            await callback.message.edit_text(
-                get_premium_emoji_message(
-                    f"✅ *Premium на {months} месяцев успешно оформлен!*\n\n"
-                    f"{get_emoji('star')} Списано: {stars_price} ⭐\n"
-                    f"{get_emoji('fire')} Premium активирован!"
-                ),
-                reply_markup=get_main_keyboard(user_id),
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await callback.message.edit_text(
-                get_premium_emoji_message(f"❌ *Ошибка:* {result}"),
-                reply_markup=get_main_keyboard(user_id),
-                parse_mode=ParseMode.HTML
-            )
-        await callback.answer()
-        return
-
-    # === АКТИВАЦИЯ ПРОМОКОДА ===
-
-    if data == "activate_promo":
-        waiting_for[user_id] = "promo"
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('gift')} *Активация промокода* {get_emoji('gift')}\n\n"
-                f"Введите промокод текстовым сообщением:"
-            ),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === ЕЖЕДНЕВНЫЙ БОНУС ===
-
-    if data == "daily_bonus":
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT last_claim, streak FROM daily_bonus WHERE user_id = ?", (user_id,))
-            result = cursor.fetchone()
-
-            last_claim = result[0] if result else 0
-            streak = result[1] if result else 0
-
-            # Проверка возможности получения бонуса
-            today_start = int(time.time()) // 86400
-            last_claim_start = last_claim // 86400
-
-            if last_claim_start == today_start:
-                remaining = 86400 - (int(time.time()) - last_claim)
-                hours = remaining // 3600
-                minutes = (remaining % 3600) // 60
-                await callback.answer(f"Бонус будет доступен через {hours}ч {minutes}мин", show_alert=True)
-                return
-
-            # Расчёт бонуса
-            if last_claim_start == today_start - 1:
-                streak = min(streak + 1, 30)
-            else:
-                streak = 1
-
-            base_bonus = 5
-            multiplier = min(2 + (streak // 7), 5)
-            bonus = base_bonus * multiplier
-
-            add_stars(user_id, bonus, f"Ежедневный бонус: день {streak}")
-
-            cursor.execute("""
-                INSERT OR REPLACE INTO daily_bonus (user_id, last_claim, streak)
-                VALUES (?, ?, ?)
-            """, (user_id, int(time.time()), streak))
-
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('gift')} *ЕЖЕДНЕВНЫЙ БОНУС* {get_emoji('gift')}\n\n"
-                f"{get_emoji('star')} Вы получили +{bonus} звезд!\n"
-                f"{get_emoji('fire')} День: {streak} 🔥\n"
-                f"{get_emoji('rocket')} Множитель: x{multiplier}\n\n"
-                f"Возвращайтесь завтра за следующим бонусом!"
-            ),
-            reply_markup=get_main_keyboard(user_id),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === РЕФЕРАЛЬНАЯ СИСТЕМА ===
-
-    if data == "referral_menu":
-        user = get_user(user_id)
-        bot_username = (await client.get_me()).username
-        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('users')} *РЕФЕРАЛЬНАЯ ПРОГРАММА* {get_emoji('users')}\n\n"
-                f"{get_emoji('star')} За каждого приглашенного: +{REFERRAL_BONUS} ⭐\n"
-                f"{get_emoji('diamond')} Ваших рефералов: {user['referral_count']}\n"
-                f"{get_emoji('gift')} Заработано: {user['referral_count'] * REFERRAL_BONUS} ⭐\n\n"
-                f"🔗 *Ваша реферальная ссылка:*\n"
-                f"`{ref_link}`\n\n"
-                f"{get_emoji('info')} Поделитесь ссылкой с друзьями!"
-            ),
-            reply_markup=get_referral_keyboard(user_id, str(user_id)),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === ИСТОРИЯ ТРАНЗАКЦИЙ ===
-
-    if data == "transaction_history":
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT created_at, stars_amount, premium_months, amount_rub, status 
-                FROM transactions 
-                WHERE user_id = ? AND status = 'completed'
-                ORDER BY created_at DESC LIMIT 10
-            """, (user_id,))
-            txs = cursor.fetchall()
-
-        if not txs:
-            text = f"{get_emoji('info')} У вас пока нет операций"
-        else:
-            text = f"{get_emoji('list')} *Последние операции:*\n\n"
-            for tx in txs:
-                date = datetime.fromtimestamp(tx[0]).strftime("%d.%m.%Y %H:%M")
-                if tx[1]:
-                    text += f"⭐ +{tx[1]} звезд | {date}\n"
-                elif tx[2]:
-                    text += f"👑 Premium {tx[2]} мес. | {date}\n"
-                elif tx[3]:
-                    text += f"💰 Пополнение {tx[3]} ₽ | {date}\n"
-
-        await callback.message.edit_text(
-            get_premium_emoji_message(text),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="my_wallet")]]),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === О БОТЕ ===
-
-    if data == "about_menu":
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('info')} *О НАС* {get_emoji('info')}\n\n"
-                f"⭐ *Stars & Premium Shop*\n\n"
-                f"Мы предлагаем:\n"
-                f"• Telegram Stars по лучшим ценам\n"
-                f"• Premium подписки\n"
-                f"• Мгновенная выдача через Fragment\n"
-                f"• Поддержка 24/7\n\n"
-                f"💎 *Контакты:* @support\n"
-                f"📢 *Канал:* @news_channel"
-            ),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === АДМИН: УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ===
-
-    if data == "admin_users_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('users')} *Управление пользователями* {get_emoji('users')}",
-            reply_markup=get_admin_users_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data == "admin_user_stats" and is_admin(user_id):
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM users")
-            total = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM users WHERE premium_until > ?", (int(time.time()),))
-            premium = cursor.fetchone()[0]
-            cursor.execute("SELECT SUM(balance) FROM users")
-            total_balance = cursor.fetchone()[0] or 0
-            cursor.execute("SELECT COUNT(*) FROM users WHERE join_date > ?", (int(time.time()) - 86400,))
-            new_today = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM users WHERE last_active > ?", (int(time.time()) - 86400,))
-            active_today = cursor.fetchone()[0]
-
-        text = f"""
-📊 *СТАТИСТИКА ПОЛЬЗОВАТЕЛЕЙ*
-
-👥 Всего: {total}
-💎 Premium: {premium}
-⭐ Баланс: {total_balance}
-📈 Новых за 24ч: {new_today}
-✅ Активных за 24ч: {active_today}
-"""
-        await callback.message.edit_text(text, reply_markup=get_admin_users_keyboard(), parse_mode=ParseMode.MARKDOWN)
-        await callback.answer()
-        return
-
-    if data == "admin_give_stars" and is_admin(user_id):
-        waiting_for[user_id] = "give_stars"
-        await callback.message.edit_text(
-            "⭐ *Выдача звезд*\n\nВведите команду:\n`/give_stars @username количество`\n\nПример: `/give_stars @durov 100`",
             parse_mode=ParseMode.MARKDOWN
         )
-        await callback.answer()
-        return
 
-    if data == "admin_give_premium" and is_admin(user_id):
-        waiting_for[user_id] = "give_premium"
-        await callback.message.edit_text(
-            "👑 *Выдача Premium*\n\nВведите команду:\n`/give_premium @username месяцы`\n\nПример: `/give_premium @durov 3`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await callback.answer()
-        return
-
-    # === АДМИН: СТАТИСТИКА ===
-
-    if data == "admin_stats_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('stats')} *Статистика и аналитика* {get_emoji('stats')}",
-            reply_markup=get_admin_stats_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data == "admin_general_stats" and is_admin(user_id):
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM users")
-            total_users = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM tasks WHERE is_active = 1")
-            active_tasks = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM completed_tasks")
-            total_completions = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM promocodes WHERE is_active = 1")
-            active_promos = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM blacklist")
-            banned = cursor.fetchone()[0]
-
-        text = f"""
-📈 *ОБЩАЯ СТАТИСТИКА*
-
-👥 Пользователей: {total_users}
-📝 Активных заданий: {active_tasks}
-✅ Выполнено заданий: {total_completions}
-🎟 Активных промокодов: {active_promos}
-🚫 Заблокировано: {banned}
-"""
-        await callback.message.edit_text(text, reply_markup=get_admin_stats_keyboard(), parse_mode=ParseMode.MARKDOWN)
-        await callback.answer()
-        return
-
-    if data == "admin_finance_stats" and is_admin(user_id):
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT SUM(amount_rub) FROM transactions WHERE status = 'completed'")
-            total_income = cursor.fetchone()[0] or 0
-            cursor.execute("SELECT SUM(amount_rub) FROM transactions WHERE status = 'completed' AND completed_at > ?",
-                           (int(time.time()) - 30 * 86400,))
-            month_income = cursor.fetchone()[0] or 0
-            cursor.execute("SELECT SUM(stars_amount) FROM transactions WHERE status = 'completed'")
-            total_stars_sold = cursor.fetchone()[0] or 0
-            cursor.execute("SELECT COUNT(*) FROM transactions WHERE premium_months > 0 AND status = 'completed'")
-            premium_sales = cursor.fetchone()[0] or 0
-
-        text = f"""
-💰 *ФИНАНСОВАЯ СТАТИСТИКА*
-
-💵 Общий доход: {total_income} ₽
-📆 Доход за месяц: {month_income} ₽
-⭐ Продано звезд: {total_stars_sold}
-👑 Продано Premium: {premium_sales}
-"""
-        await callback.message.edit_text(text, reply_markup=get_admin_stats_keyboard(), parse_mode=ParseMode.MARKDOWN)
-        await callback.answer()
-        return
-
-    # === АДМИН: РАССЫЛКИ ===
-
-    if data == "admin_mailing_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('mail')} *Панель рассылок* {get_emoji('mail')}",
-            reply_markup=get_admin_mailing_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data == "admin_new_mailing" and is_admin(user_id):
-        waiting_for[user_id] = "mailing"
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('rocket')} *СОЗДАНИЕ РАССЫЛКИ* {get_emoji('rocket')}\n\n"
-                f"Отправьте сообщение для рассылки.\n\n"
-                f"{get_emoji('info')} Поддерживается:\n"
-                f"• Текст с {get_emoji('fire')} премиум-эмодзи\n"
-                f"• Фото, видео, документы\n"
-                f"• Инлайн-кнопки (если прикрепить)\n\n"
-                f"Отправьте сообщение сейчас:"
-            ),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === АДМИН: ПРОМОКОДЫ ===
-
-    if data == "admin_promocodes_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('code')} *Управление промокодами* {get_emoji('code')}",
-            reply_markup=get_admin_promocodes_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data == "admin_list_promocodes" and is_admin(user_id):
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT code, reward_stars, reward_premium_days, max_uses, used_count, is_active FROM promocodes ORDER BY created_at DESC LIMIT 20")
-            promos = cursor.fetchall()
-
-        if not promos:
-            text = "📋 Промокодов нет"
-        else:
-            text = "📋 *СПИСОК ПРОМОКОДОВ*\n\n"
-            for promo in promos:
-                code, stars, days, max_uses, used, active = promo
-                status = "✅" if active else "❌"
-                reward = f"{stars}⭐" if stars else f"{days}дн."
-                text += f"{status} `{code}` | {reward} | {used}/{max_uses}\n"
-
-        await callback.message.edit_text(text, reply_markup=get_admin_promocodes_keyboard(),
-                                         parse_mode=ParseMode.MARKDOWN)
-        await callback.answer()
-        return
-
-    if data == "admin_create_promo" and is_admin(user_id):
-        waiting_for[user_id] = "create_promo"
-        await callback.message.edit_text(
-            "🎟 *Создание промокода*\n\nФормат:\n`/create_promo stars 100 50` - 100 звезд\n`/create_promo premium 30 10` - 30 дней\n`/create_promo balance 500 20` - 500 звезд на баланс",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await callback.answer()
-        return
-
-    # === АДМИН: ЗАДАНИЯ ===
-
-    if data == "admin_tasks_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('rocket')} *Управление заданиями* {get_emoji('rocket')}",
-            reply_markup=get_admin_tasks_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data == "admin_tasks_list" and is_admin(user_id):
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, title, reward_stars, task_type, is_active FROM tasks ORDER BY order_index")
-            tasks = cursor.fetchall()
-
-        if tasks:
-            text = "📋 *СПИСОК ЗАДАНИЙ*\n\n"
-            for t in tasks:
-                status = "✅" if t[4] else "❌"
-                text += f"{status} ID `{t[0]}` | {t[1]} | +{t[2]}⭐\n"
-            text += "\nДля удаления: `/del_task ID`"
-        else:
-            text = "📋 Заданий нет"
-
-        await callback.message.edit_text(text, reply_markup=get_admin_tasks_keyboard(), parse_mode=ParseMode.MARKDOWN)
-        await callback.answer()
-        return
-
-    if data == "admin_create_task" and is_admin(user_id):
-        waiting_for[user_id] = "create_task"
-        await callback.message.edit_text(
-            "📝 *Создание задания*\n\nФормат:\n`/add_task Название | Описание | награда | канал`\n\nПример: `/add_task Подписка | Подпишись на новости | 50 | my_channel`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await callback.answer()
-        return
-
-    # === АДМИН: НАСТРОЙКИ ===
-
-    if data == "admin_settings_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('settings')} *Настройки бота* {get_emoji('settings')}",
-            reply_markup=get_admin_settings_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === АДМИН: ФИНАНСЫ ===
-
-    if data == "admin_finance_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('diamond')} *Финансовое управление* {get_emoji('diamond')}",
-            reply_markup=get_admin_finance_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    # === АДМИН: БЕЗОПАСНОСТЬ ===
-
-    if data == "admin_security_menu" and is_admin(user_id):
-        await callback.message.edit_text(
-            f"{get_emoji('lock')} *Безопасность* {get_emoji('lock')}",
-            reply_markup=get_admin_security_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
-        return
-
-    if data == "admin_blacklist" and is_admin(user_id):
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, reason, banned_at FROM blacklist ORDER BY banned_at DESC LIMIT 20")
-            banned = cursor.fetchall()
-
-        if banned:
-            text = "🚫 *ЧЁРНЫЙ СПИСОК*\n\n"
-            for b in banned:
-                uid, reason, date = b
-                text += f"• `{uid}` | {reason[:30]}\n"
-        else:
-            text = "🚫 Чёрный список пуст"
-
-        await callback.message.edit_text(text, reply_markup=get_admin_security_keyboard(),
-                                         parse_mode=ParseMode.MARKDOWN)
-        await callback.answer()
-        return
-
-    # === ЗАДАНИЯ (ПОЛЬЗОВАТЕЛЬСКИЕ) ===
-
-    if data == "tasks_menu":
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id, title, description, reward_stars, task_type, target_id FROM tasks WHERE is_active = 1 ORDER BY order_index")
-            tasks = cursor.fetchall()
-
-        if not tasks:
-            await callback.message.edit_text(
-                get_premium_emoji_message(f"{get_emoji('info')} *Нет доступных заданий*"),
-                reply_markup=get_main_keyboard(user_id),
-                parse_mode=ParseMode.HTML
+async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание платежа через выбранную систему"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    _, payment_system, order_id, amount, product_type = data.split(":")
+    amount = int(amount)
+    
+    await query.edit_message_text(
+        f"{EMOJI['rocket']} *Создание платежа...*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    if payment_system == "cryptobot":
+        invoice = await cryptobot.create_invoice(amount, order_id)
+        if invoice:
+            await query.edit_message_text(
+                f"💳 *Оплата через CryptoBot*\n\n"
+                f"Сумма: {amount} ₽\n\n"
+                f"🔗 [Нажмите для оплаты]({invoice['pay_url']})\n\n"
+                f"{EMOJI['info']} После оплаты товар придет автоматически!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Оплатить", url=invoice['pay_url'])],
+                    [InlineKeyboardButton("🔙 Назад", callback_data="buy_stars_menu")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
             )
-            await callback.answer()
-            return
+            update_transaction_status(order_id, "pending", str(invoice['invoice_id']))
+        else:
+            await query.edit_message_text(
+                f"❌ *Ошибка создания платежа*\n\nПопробуйте позже или выберите другой способ.",
+                reply_markup=get_stars_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    elif payment_system == "platega":
+        invoice = await platega.create_transaction(amount, order_id, f"Покупка {product_type}")
+        if invoice:
+            await query.edit_message_text(
+                f"💳 *Оплата через Platega.io*\n\n"
+                f"Сумма: {amount} ₽\n\n"
+                f"🔗 [Нажмите для оплаты]({invoice['payment_url']})\n\n"
+                f"{EMOJI['info']} После оплаты товар придет автоматически!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Оплатить", url=invoice['payment_url'])],
+                    [InlineKeyboardButton("🔙 Назад", callback_data="buy_stars_menu")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ *Ошибка создания платежа*\n\nПопробуйте позже.",
+                reply_markup=get_stars_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
 
-        buttons = []
-        for task in tasks:
-            task_id, title, desc, reward, task_type, target = task
-            with db_transaction() as conn:
-                cursor2 = conn.cursor()
-                cursor2.execute("SELECT 1 FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
-                completed = cursor2.fetchone()
+async def activate_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Активация промокода"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['waiting_for_promo'] = True
+    
+    await query.edit_message_text(
+        f"{EMOJI['gift']} *Активация промокода* {EMOJI['gift']}\n\n"
+        f"Введите промокод текстовым сообщением:",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-            status = "✅" if completed else "📌"
-            buttons.append(
-                [InlineKeyboardButton(f"{status} {title} (+{reward}⭐)", callback_data=f"view_task:{task_id}")])
-
-        buttons.append([InlineKeyboardButton(f"{get_emoji('back')} Назад", callback_data="back_to_main")])
-
-        await callback.message.edit_text(
-            get_premium_emoji_message(
-                f"{get_emoji('rocket')} *ДОСТУПНЫЕ ЗАДАНИЯ* {get_emoji('rocket')}\n\n"
-                f"✅ - выполнено | 📌 - доступно\n"
-                f"Выполняйте и получайте звезды!"
-            ),
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
+async def handle_promo_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка введенного промокода"""
+    if not context.user_data.get('waiting_for_promo'):
         return
-
-    if data.startswith("view_task:"):
-        task_id = int(data.split(":")[1])
-
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id, title, description, reward_stars, task_type, target_id, target_url FROM tasks WHERE id = ? AND is_active = 1",
-                (task_id,))
-            task = cursor.fetchone()
-
-        if not task:
-            await callback.answer("Задание не найдено")
+    
+    user_id = update.effective_user.id
+    code = update.message.text.upper().strip()
+    
+    del context.user_data['waiting_for_promo']
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT reward_stars, reward_premium_days, max_uses, used_count, is_active, expires_at FROM promocodes WHERE code = ?",
+            (code,)
+        )
+        promo = cursor.fetchone()
+    
+    if not promo:
+        await update.message.reply_text(
+            f"{EMOJI['cross']} *Промокод не найден!*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    reward_stars, reward_days, max_uses, used_count, is_active, expires_at = promo
+    
+    if not is_active or used_count >= max_uses:
+        await update.message.reply_text(
+            f"{EMOJI['cross']} *Промокод неактивен или использован максимальное число раз!*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    if expires_at and expires_at < int(time.time()):
+        await update.message.reply_text(
+            f"{EMOJI['cross']} *Срок действия промокода истек!*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM promo_usage WHERE user_id = ? AND code = ?", (user_id, code))
+        if cursor.fetchone():
+            await update.message.reply_text(
+                f"{EMOJI['cross']} *Вы уже активировали этот промокод!*",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
+        
+        if reward_stars > 0:
+            add_stars(user_id, reward_stars, f"Promocode {code}")
+            await update.message.reply_text(
+                f"{EMOJI['check']} *Промокод активирован!*\n\n{EMOJI['star']} +{reward_stars} звезд",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        if reward_days > 0:
+            await update.message.reply_text(
+                f"{EMOJI['check']} *Промокод активирован!*\n\n{EMOJI['crown']} +{reward_days} дней Premium",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        cursor.execute("UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?", (code,))
+        cursor.execute("INSERT INTO promo_usage (user_id, code, used_at) VALUES (?, ?, ?)", (user_id, code, int(time.time())))
 
-        task_id, title, desc, reward, task_type, target_id, target_url = task
-
+async def tasks_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню заданий"""
+    query = update.callback_query
+    await query.answer()
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, title, description, reward_stars, target_id FROM tasks WHERE is_active = 1")
+        tasks = cursor.fetchall()
+    
+    if not tasks:
+        await query.edit_message_text(
+            f"{EMOJI['info']} *Нет доступных заданий*\n\nЗагляните позже!",
+            reply_markup=get_main_keyboard(query.from_user.id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    buttons = []
+    for task in tasks:
+        task_id, title, desc, reward, target = task
+        
         with db_transaction() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
-            if cursor.fetchone():
-                await callback.answer("✅ Вы уже выполнили это задание!", show_alert=True)
-                return
+            cursor.execute("SELECT 1 FROM completed_tasks WHERE user_id = ? AND task_id = ?", (query.from_user.id, task_id))
+            completed = cursor.fetchone()
+        
+        status = "✅" if completed else "📌"
+        buttons.append([InlineKeyboardButton(f"{status} {title} (+{reward}⭐)", callback_data=f"view_task:{task_id}")])
+    
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
+    
+    await query.edit_message_text(
+        f"{EMOJI['rocket']} *Доступные задания* {EMOJI['rocket']}\n\n"
+        f"✅ - выполнено | 📌 - доступно\n"
+        f"Выполняйте и получайте звезды!",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-        text = f"""
+async def view_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр задания"""
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = int(query.data.split(":")[1])
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, title, description, reward_stars, task_type, target_id FROM tasks WHERE id = ? AND is_active = 1", (task_id,))
+        task = cursor.fetchone()
+    
+    if not task:
+        await query.answer("Задание не найдено!")
+        return
+    
+    task_id, title, desc, reward, task_type, target = task
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM completed_tasks WHERE user_id = ? AND task_id = ?", (query.from_user.id, task_id))
+        if cursor.fetchone():
+            await query.answer("✅ Вы уже выполнили это задание!", show_alert=True)
+            return
+    
+    text = f"""
 📋 *{title}*
 
 {desc}
 
-{get_emoji('star')} *Награда:* {reward} ⭐
-{get_emoji('info')} *Тип:* {TASK_TYPES.get(task_type, {}).get('name', 'Задание')}
+{EMOJI['star']} *Награда:* {reward} ⭐
+{EMOJI['info']} *Тип:* Подписка на канал
 
 *Как выполнить:*
-• Подпишитесь на @{target_id}
+• Подпишитесь на канал @{target}
 • Нажмите кнопку проверки
 """
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Подписаться", url=f"https://t.me/{target}")],
+            [InlineKeyboardButton("✅ Проверить", callback_data=f"check_task:{task_id}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="tasks_menu")]
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-        await callback.message.edit_text(
-            get_premium_emoji_message(text),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Подписаться", url=f"https://t.me/{target_id}")],
-                [InlineKeyboardButton("✅ Проверить", callback_data=f"check_task:{task_id}")],
-                [InlineKeyboardButton("🔙 Назад", callback_data="tasks_menu")]
-            ]),
-            parse_mode=ParseMode.HTML
-        )
-        await callback.answer()
+async def check_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка выполнения задания"""
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = int(query.data.split(":")[1])
+    user_id = query.from_user.id
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT target_id, reward_stars FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+    
+    if not task:
+        await query.answer("Задание не найдено!")
         return
-
-    if data.startswith("check_task:"):
-        task_id = int(data.split(":")[1])
-
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT target_id, reward_stars FROM tasks WHERE id = ?", (task_id,))
-            task = cursor.fetchone()
-
-        if not task:
-            await callback.answer("Задание не найдено")
-            return
-
-        target_id, reward = task
-
-        # Проверка подписки
-        try:
-            member = await client.get_chat_member(f"@{target_id}", user_id)
-            if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-                with db_transaction() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT 1 FROM completed_tasks WHERE user_id = ? AND task_id = ?",
-                                   (user_id, task_id))
-                    if not cursor.fetchone():
-                        add_stars(user_id, reward, f"Задание {task_id}")
-                        cursor.execute("INSERT INTO completed_tasks (user_id, task_id, completed_at) VALUES (?, ?, ?)",
-                                       (user_id, task_id, int(time.time())))
-
-                        await callback.message.edit_text(
-                            get_premium_emoji_message(
-                                f"✅ *Задание выполнено!*\n\n{get_emoji('star')} Вы получили {reward} звезд!"
-                            ),
-                            reply_markup=get_main_keyboard(user_id),
-                            parse_mode=ParseMode.HTML
-                        )
-                    else:
-                        await callback.message.edit_text(
-                            get_premium_emoji_message("✅ Вы уже получали награду!"),
-                            reply_markup=get_main_keyboard(user_id),
-                            parse_mode=ParseMode.HTML
-                        )
-            else:
-                await callback.answer("❌ Вы не подписаны на канал!", show_alert=True)
-        except UserNotParticipant:
-            await callback.answer("❌ Вы не подписаны на канал!", show_alert=True)
-        except Exception as e:
-            await callback.answer(f"Ошибка: {str(e)}", show_alert=True)
-
-        await callback.answer()
-        return
-
-
-# ===== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ =====
-
-@app.on_message(filters.text & filters.private)
-async def handle_text(client: Client, message: Message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-
-    if is_banned(user_id):
-        await message.reply("🚫 Вы заблокированы!")
-        return
-
-    # Промокод
-    if waiting_for.get(user_id) == "promo":
-        code = text.upper()
-
-        with db_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT reward_stars, reward_premium_days, reward_balance, max_uses, used_count, is_active, expires_at FROM promocodes WHERE code = ?",
-                (code,))
-            promo = cursor.fetchone()
-
-        if not promo:
-            await message.reply(get_premium_emoji_message(f"{get_emoji('cross')} *Промокод не найден!*"),
-                                parse_mode=ParseMode.HTML)
+    
+    target_id, reward = task
+    
+    # Проверка подписки через Telegram Bot API
+    try:
+        chat_member = await context.bot.get_chat_member(chat_id=f"@{target_id}", user_id=user_id)
+        if chat_member.status in ['member', 'administrator', 'creator']:
+            with db_transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
+                if not cursor.fetchone():
+                    add_stars(user_id, reward, f"Task {task_id}")
+                    cursor.execute("INSERT INTO completed_tasks (user_id, task_id, completed_at) VALUES (?, ?, ?)",
+                                 (user_id, task_id, int(time.time())))
+                    
+                    await query.edit_message_text(
+                        f"✅ *Задание выполнено!*\n\n{EMOJI['star']} +{reward} звезд",
+                        reply_markup=get_main_keyboard(user_id),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await query.answer("Вы уже получали награду!", show_alert=True)
         else:
-            reward_stars, reward_days, reward_balance, max_uses, used_count, is_active, expires_at = promo
+            await query.answer("❌ Вы не подписаны на канал!", show_alert=True)
+    except Exception as e:
+        await query.answer(f"Ошибка проверки. Убедитесь, что вы подписались!", show_alert=True)
 
-            if not is_active or used_count >= max_uses:
-                await message.reply(
-                    get_premium_emoji_message(f"{get_emoji('cross')} *Промокод неактивен или использован!*"),
-                    parse_mode=ParseMode.HTML)
-            elif expires_at and expires_at < int(time.time()):
-                await message.reply(get_premium_emoji_message(f"{get_emoji('cross')} *Срок действия истек!*"),
-                                    parse_mode=ParseMode.HTML)
-            else:
-                with db_transaction() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT 1 FROM promo_usage WHERE user_id = ? AND code = ?", (user_id, code))
-                    if cursor.fetchone():
-                        await message.reply(
-                            get_premium_emoji_message(f"{get_emoji('cross')} *Вы уже активировали этот промокод!*"),
-                            parse_mode=ParseMode.HTML)
-                    else:
-                        if reward_stars > 0:
-                            add_stars(user_id, reward_stars, f"Промокод {code}")
-                            await message.reply(get_premium_emoji_message(
-                                f"{get_emoji('check')} *Промокод активирован!* +{reward_stars} ⭐"),
-                                                parse_mode=ParseMode.HTML)
-                        if reward_days > 0:
-                            set_premium(user_id, reward_days)
-                            await message.reply(get_premium_emoji_message(
-                                f"{get_emoji('check')} *Промокод активирован!* +{reward_days} дней Premium"),
-                                                parse_mode=ParseMode.HTML)
-                        if reward_balance > 0:
-                            add_stars(user_id, reward_balance, f"Промокод {code}")
-                            await message.reply(get_premium_emoji_message(
-                                f"{get_emoji('check')} *Промокод активирован!* +{reward_balance} ⭐"),
-                                                parse_mode=ParseMode.HTML)
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """О боте"""
+    query = update.callback_query
+    await query.answer()
+    
+    text = f"""
+{EMOJI['info']} *О НАС* {EMOJI['info']}
 
-                        cursor.execute("UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?", (code,))
-                        cursor.execute("INSERT INTO promo_usage (user_id, code, used_at) VALUES (?, ?, ?)",
-                                       (user_id, code, int(time.time())))
+⭐ *Stars & Premium Shop*
 
-        waiting_for[user_id] = None
+Мы предлагаем:
+• Telegram Stars по лучшим ценам
+• Premium подписки от 3 месяцев
+• Мгновенная выдача через Fragment API
+• Поддержка 24/7
+
+{EMOJI['diamond']} *Платежные системы:*
+• CryptoBot
+• Platega.io
+
+{EMOJI['contact']} *Поддержка:* @support
+{EMOJI['news']} *Новости:* @news_channel
+"""
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат в главное меню"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    await query.edit_message_text(
+        f"{EMOJI['star']} *Главное меню* {EMOJI['star']}\n\n{EMOJI['wallet']} Баланс: {user['balance']} ⭐",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ================= АДМИН ФУНКЦИИ =================
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ панель"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
         return
+    
+    await query.answer()
+    await query.edit_message_text(
+        f"{EMOJI['settings']} *Панель администратора* {EMOJI['settings']}",
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-    # Рассылка (админ)
-    if waiting_for.get(user_id) == "mailing" and is_admin(user_id):
-        await message.reply(get_premium_emoji_message(f"{get_emoji('rocket')} *Начинаю рассылку...*"),
-                            parse_mode=ParseMode.HTML)
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика бота"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT SUM(balance) FROM users")
+        total_balance = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT SUM(amount_rub) FROM transactions WHERE status = 'completed'")
+        total_income = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM transactions WHERE status = 'completed' AND stars_amount > 0")
+        stars_sales = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM transactions WHERE status = 'completed' AND premium_months > 0")
+        premium_sales = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM completed_tasks")
+        tasks_completed = cursor.fetchone()[0] or 0
+    
+    text = f"""
+{EMOJI['stats']} *СТАТИСТИКА БОТА* {EMOJI['stats']}
 
+👥 *Пользователей:* {total_users}
+⭐ *Баланс пользователей:* {total_balance}
+💰 *Доход:* {total_income} ₽
+
+📊 *ПРОДАЖИ:*
+{EMOJI['star']} Продано звезд: {stars_sales}
+{EMOJI['crown']} Продано Premium: {premium_sales}
+
+📋 *ЗАДАНИЯ:*
+✅ Выполнено заданий: {tasks_completed}
+"""
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_fragment_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка баланса Fragment кошелька"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    await query.edit_message_text(
+        f"{EMOJI['rocket']} *Проверка баланса Fragment...*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    balance = fragment_client.get_balance()
+    
+    if balance.get('ok'):
+        text = f"""
+{EMOJI['diamond']} *БАЛАНС FRAGMENT* {EMOJI['diamond']}
+
+💰 *Баланс TON:* {balance.get('balance', 0)} TON
+
+{EMOJI['info']} Эти средства используются для покупки звезд и Premium.
+"""
+    else:
+        text = f"""
+❌ *Ошибка получения баланса*
+
+{balance.get('error', 'Unknown error')}
+
+Проверьте настройки Fragment API.
+"""
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_give_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выдача звезд пользователю (админ команда)"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    context.user_data['admin_action'] = 'give_stars'
+    
+    await query.edit_message_text(
+        f"{EMOJI['star']} *Выдача звезд*\n\n"
+        f"Введите команду:\n"
+        f"`/give_stars @username количество`\n\n"
+        f"Пример: `/give_stars @durov 100`",
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_give_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выдача Premium пользователю (админ команда)"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    context.user_data['admin_action'] = 'give_premium'
+    
+    await query.edit_message_text(
+        f"{EMOJI['crown']} *Выдача Premium*\n\n"
+        f"Введите команду:\n"
+        f"`/give_premium @username месяцы`\n\n"
+        f"Пример: `/give_premium @durov 3`",
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_mailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Рассылка сообщений"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    context.user_data['admin_action'] = 'mailing'
+    
+    await query.edit_message_text(
+        f"{EMOJI['mail']} *Создание рассылки* {EMOJI['mail']}\n\n"
+        f"Отправьте сообщение для рассылки.\n\n"
+        f"{EMOJI['info']} Поддерживается текст, фото, видео.\n"
+        f"Для отмены отправьте /cancel",
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_blacklist_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню черного списка"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    context.user_data['admin_action'] = 'blacklist'
+    
+    await query.edit_message_text(
+        f"{EMOJI['lock']} *Чёрный список* {EMOJI['lock']}\n\n"
+        f"Введите команду:\n"
+        f"`/ban @username причина` - заблокировать\n"
+        f"`/unban @username` - разблокировать\n\n"
+        f"Пример: `/ban @spamer Спам`",
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_promocodes_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления промокодами"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT code, reward_stars, reward_premium_days, max_uses, used_count, is_active FROM promocodes ORDER BY created_at DESC LIMIT 10")
+        promos = cursor.fetchall()
+    
+    if promos:
+        text = f"{EMOJI['code']} *Активные промокоды:*\n\n"
+        for promo in promos:
+            code, stars, days, max_uses, used, active = promo
+            status = "✅" if active else "❌"
+            reward = f"{stars}⭐" if stars else f"{days}дн."
+            text += f"{status} `{code}` | {reward} | {used}/{max_uses}\n"
+    else:
+        text = f"{EMOJI['info']} Промокодов нет"
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Создать", callback_data="admin_create_promo")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_create_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание промокода"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    context.user_data['admin_action'] = 'create_promo'
+    
+    await query.edit_message_text(
+        f"{EMOJI['gift']} *Создание промокода*\n\n"
+        f"Введите команду:\n"
+        f"`/create_promo stars 100 50` - 100 звезд, 50 активаций\n"
+        f"`/create_promo premium 30 10` - 30 дней Premium, 10 активаций\n\n"
+        f"Пример: `/create_promo stars 500 100`",
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_tasks_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления заданиями"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, title, reward_stars, is_active FROM tasks ORDER BY id")
+        tasks = cursor.fetchall()
+    
+    if tasks:
+        text = f"{EMOJI['rocket']} *Список заданий:*\n\n"
+        for task in tasks:
+            task_id, title, reward, active = task
+            status = "✅" if active else "❌"
+            text += f"{status} ID `{task_id}` | {title} | +{reward}⭐\n"
+        text += f"\n{EMOJI['info']} Для удаления: `/del_task ID`"
+    else:
+        text = f"{EMOJI['info']} Заданий нет"
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Создать", callback_data="admin_create_task")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_create_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание задания"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    context.user_data['admin_action'] = 'create_task'
+    
+    await query.edit_message_text(
+        f"{EMOJI['plus']} *Создание задания*\n\n"
+        f"Введите команду:\n"
+        f"`/add_task Название | Описание | награда | канал`\n\n"
+        f"Пример: `/add_task Подписка | Подпишись на новости | 50 | my_channel`",
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Информация о пользователях"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not is_admin(user_id):
+        await query.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users WHERE join_date > ?", (int(time.time()) - 86400,))
+        new_today = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users WHERE last_active > ?", (int(time.time()) - 86400,))
+        active_today = cursor.fetchone()[0]
+        cursor.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 5")
+        top_users = cursor.fetchall()
+    
+    text = f"""
+{EMOJI['users']} *ПОЛЬЗОВАТЕЛИ* {EMOJI['users']}
+
+👥 *Всего:* {total}
+📈 *Новых за 24ч:* {new_today}
+✅ *Активных за 24ч:* {active_today}
+
+{EMOJI['star']} *ТОП-5 ПО БАЛАНСУ:*
+"""
+    
+    for i, (uid, username, balance) in enumerate(top_users, 1):
+        name = username or str(uid)
+        text += f"{i}. @{name} - {balance}⭐\n"
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=get_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ================= ОБРАБОТКА ТЕКСТОВЫХ КОМАНД (АДМИН) =================
+
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых команд от админов"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        return
+    
+    text = update.message.text.strip()
+    
+    # Рассылка
+    if context.user_data.get('admin_action') == 'mailing':
+        await update.message.reply_text(f"{EMOJI['rocket']} *Начинаю рассылку...*", parse_mode=ParseMode.MARKDOWN)
+        
         with db_transaction() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users")
             users = cursor.fetchall()
-
+        
         success = 0
         fail = 0
-
+        
         for (uid,) in users:
             try:
-                await message.copy(uid)
+                await update.message.copy(uid)
                 success += 1
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-                try:
-                    await message.copy(uid)
-                    success += 1
-                except:
-                    fail += 1
-            except:
+            except Exception:
                 fail += 1
             await asyncio.sleep(0.05)
-
-        await message.reply(
-            get_premium_emoji_message(
-                f"{get_emoji('check')} *РАССЫЛКА ЗАВЕРШЕНА* {get_emoji('check')}\n\n"
-                f"✅ Успешно: {success}\n"
-                f"❌ Ошибок: {fail}"
-            ),
-            parse_mode=ParseMode.HTML
+        
+        await update.message.reply_text(
+            f"{EMOJI['check']} *Рассылка завершена!*\n\n✅ Успешно: {success}\n❌ Ошибок: {fail}",
+            parse_mode=ParseMode.MARKDOWN
         )
-        waiting_for[user_id] = None
+        context.user_data['admin_action'] = None
+        return
+    
+    # Выдача звезд
+    if text.startswith("/give_stars"):
+        parts = text.split()
+        if len(parts) == 3:
+            username = parts[1].lstrip('@')
+            amount = int(parts[2])
+            
+            success, tx_hash = await send_stars_to_user(username, amount)
+            
+            if success:
+                await update.message.reply_text(
+                    f"{EMOJI['check']} *{amount} звезд отправлено* @{username}\nTX: `{tx_hash}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"{EMOJI['cross']} *Ошибка:* {tx_hash}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['warning']} Использование: `/give_stars @username количество`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        context.user_data['admin_action'] = None
+        return
+    
+    # Выдача Premium
+    if text.startswith("/give_premium"):
+        parts = text.split()
+        if len(parts) == 3:
+            username = parts[1].lstrip('@')
+            months = int(parts[2])
+            
+            success, tx_hash = await send_premium_to_user(username, months)
+            
+            if success:
+                await update.message.reply_text(
+                    f"{EMOJI['check']} *Premium на {months} месяцев отправлен* @{username}\nTX: `{tx_hash}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"{EMOJI['cross']} *Ошибка:* {tx_hash}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['warning']} Использование: `/give_premium @username месяцы`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        context.user_data['admin_action'] = None
+        return
+    
+    # Создание промокода
+    if text.startswith("/create_promo"):
+        parts = text.split()
+        if len(parts) == 4:
+            ptype = parts[1]
+            value = int(parts[2])
+            max_uses = int(parts[3])
+            code = generate_promo_code()
+            
+            with db_transaction() as conn:
+                cursor = conn.cursor()
+                if ptype == "stars":
+                    cursor.execute(
+                        "INSERT INTO promocodes (code, reward_stars, max_uses, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (code, value, max_uses, user_id, int(time.time()))
+                    )
+                    await update.message.reply_text(
+                        f"{EMOJI['check']} *Промокод создан!*\n\n"
+                        f"`{code}`\n"
+                        f"{EMOJI['star']} Награда: {value} ⭐\n"
+                        f"{EMOJI['users']} Активаций: {max_uses}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                elif ptype == "premium":
+                    cursor.execute(
+                        "INSERT INTO promocodes (code, reward_premium_days, max_uses, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (code, value, max_uses, user_id, int(time.time()))
+                    )
+                    await update.message.reply_text(
+                        f"{EMOJI['check']} *Промокод создан!*\n\n"
+                        f"`{code}`\n"
+                        f"{EMOJI['crown']} Награда: {value} дней Premium\n"
+                        f"{EMOJI['users']} Активаций: {max_uses}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['warning']} Использование: `/create_promo stars|premium значение лимит`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        context.user_data['admin_action'] = None
+        return
+    
+    # Создание задания
+    if text.startswith("/add_task"):
+        try:
+            parts = text[9:].split("|")
+            if len(parts) >= 4:
+                title = parts[0].strip()
+                desc = parts[1].strip()
+                reward = int(parts[2].strip())
+                channel = parts[3].strip().lstrip('@')
+                
+                with db_transaction() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "INSERT INTO tasks (title, description, reward_stars, task_type, target_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (title, desc, reward, "channel_sub", channel, user_id, int(time.time()))
+                    )
+                await update.message.reply_text(
+                    f"{EMOJI['check']} *Задание создано!*\n\n"
+                    f"📋 {title}\n"
+                    f"{EMOJI['star']} +{reward}⭐\n"
+                    f"📢 Канал: @{channel}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"{EMOJI['warning']} Формат: `/add_task Название | Описание | награда | канал`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка: {e}")
+        context.user_data['admin_action'] = None
+        return
+    
+    # Удаление задания
+    if text.startswith("/del_task"):
+        parts = text.split()
+        if len(parts) == 2:
+            task_id = int(parts[1])
+            with db_transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            await update.message.reply_text(
+                f"{EMOJI['check']} *Задание {task_id} удалено*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['warning']} Использование: `/del_task ID`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+    
+    # Бан пользователя
+    if text.startswith("/ban"):
+        parts = text.split(maxsplit=2)
+        if len(parts) >= 2:
+            username = parts[1].lstrip('@')
+            reason = parts[2] if len(parts) > 2 else "Нарушение правил"
+            
+            # Поиск user_id по username
+            try:
+                chat = await context.bot.get_chat(f"@{username}")
+                target_id = chat.id
+            except:
+                await update.message.reply_text(f"❌ Пользователь @{username} не найден")
+                return
+            
+            with db_transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO blacklist (user_id, reason, banned_by, banned_at) VALUES (?, ?, ?, ?)",
+                    (target_id, reason, user_id, int(time.time()))
+                )
+            
+            await update.message.reply_text(
+                f"{EMOJI['lock']} *Пользователь @{username} заблокирован*\nПричина: {reason}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['warning']} Использование: `/ban @username причина`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+    
+    # Разбан пользователя
+    if text.startswith("/unban"):
+        parts = text.split()
+        if len(parts) == 2:
+            username = parts[1].lstrip('@')
+            
+            try:
+                chat = await context.bot.get_chat(f"@{username}")
+                target_id = chat.id
+            except:
+                await update.message.reply_text(f"❌ Пользователь @{username} не найден")
+                return
+            
+            with db_transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM blacklist WHERE user_id = ?", (target_id,))
+            
+            await update.message.reply_text(
+                f"{EMOJI['unlock']} *Пользователь @{username} разблокирован*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['warning']} Использование: `/unban @username`",
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
 
-    # Админ команды
-    if is_admin(user_id):
-        if text.startswith("/give_stars"):
-            parts = text.split()
-            if len(parts) == 3:
-                username = parts[1].lstrip('@')
-                amount = int(parts[2])
-                success, result = await send_stars_via_fragment(f"@{username}", amount)
-                if success:
-                    await message.reply(
-                        get_premium_emoji_message(f"✅ *{amount} звезд отправлено* @{username}\nTX: `{result}`"),
-                        parse_mode=ParseMode.HTML)
-                else:
-                    await message.reply(get_premium_emoji_message(f"❌ *Ошибка:* {result}"), parse_mode=ParseMode.HTML)
-            else:
-                await message.reply("Использование: `/give_stars @username количество`", parse_mode=ParseMode.MARKDOWN)
-            waiting_for[user_id] = None
-            return
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена текущего действия"""
+    if context.user_data.get('admin_action'):
+        context.user_data['admin_action'] = None
+        await update.message.reply_text(
+            f"{EMOJI['check']} *Действие отменено*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text("Нет активных действий для отмены")
 
-        if text.startswith("/give_premium"):
-            parts = text.split()
-            if len(parts) == 3:
-                username = parts[1].lstrip('@')
-                months = int(parts[2])
-                success, result = await send_premium_via_fragment(f"@{username}", months)
-                if success:
-                    await message.reply(get_premium_emoji_message(
-                        f"✅ *Premium на {months} месяцев отправлен* @{username}\nTX: `{result}`"),
-                                        parse_mode=ParseMode.HTML)
-                else:
-                    await message.reply(get_premium_emoji_message(f"❌ *Ошибка:* {result}"), parse_mode=ParseMode.HTML)
-            else:
-                await message.reply("Использование: `/give_premium @username месяцы`", parse_mode=ParseMode.MARKDOWN)
-            waiting_for[user_id] = None
-            return
+# ================= ЗАПУСК БОТА =================
 
-        if text.startswith("/create_promo"):
-            parts = text.split()
-            if len(parts) == 4:
-                ptype = parts[1]
-                value = int(parts[2])
-                max_uses = int(parts[3])
-                code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-
-                with db_transaction() as conn:
-                    cursor = conn.cursor()
-                    if ptype == "stars":
-                        cursor.execute(
-                            "INSERT INTO promocodes (code, reward_stars, max_uses, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (code, value, max_uses, user_id, int(time.time()))
-                        )
-                        await message.reply(f"✅ Промокод создан!\n`{code}`\nНаграда: {value} ⭐\nАктиваций: {max_uses}")
-                    elif ptype == "premium":
-                        cursor.execute(
-                            "INSERT INTO promocodes (code, reward_premium_days, max_uses, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (code, value, max_uses, user_id, int(time.time()))
-                        )
-                        await message.reply(
-                            f"✅ Промокод создан!\n`{code}`\nНаграда: {value} дней Premium\nАктиваций: {max_uses}")
-                    elif ptype == "balance":
-                        cursor.execute(
-                            "INSERT INTO promocodes (code, reward_balance, max_uses, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (code, value, max_uses, user_id, int(time.time()))
-                        )
-                        await message.reply(f"✅ Промокод создан!\n`{code}`\nНаграда: {value} ⭐\nАктиваций: {max_uses}")
-            else:
-                await message.reply("Использование: `/create_promo stars|premium|balance значение лимит`",
-                                    parse_mode=ParseMode.MARKDOWN)
-            waiting_for[user_id] = None
-            return
-
-        if text.startswith("/add_task"):
-            try:
-                parts = text[9:].split("|")
-                if len(parts) >= 4:
-                    title = parts[0].strip()
-                    desc = parts[1].strip()
-                    reward = int(parts[2].strip())
-                    channel = parts[3].strip().lstrip('@')
-
-                    with db_transaction() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "INSERT INTO tasks (title, description, reward_stars, task_type, target_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (title, desc, reward, "channel_sub", channel, user_id, int(time.time()))
-                        )
-                    await message.reply(f"✅ Задание создано!\n{title} | +{reward}⭐ | @{channel}")
-                else:
-                    await message.reply("Формат: `/add_task Название | Описание | награда | канал`",
-                                        parse_mode=ParseMode.MARKDOWN)
-            except Exception as e:
-                await message.reply(f"Ошибка: {e}")
-            waiting_for[user_id] = None
-            return
-
-        if text.startswith("/del_task"):
-            parts = text.split()
-            if len(parts) == 2:
-                task_id = int(parts[1])
-                with db_transaction() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-                await message.reply(f"✅ Задание {task_id} удалено")
-            else:
-                await message.reply("Использование: `/del_task ID`", parse_mode=ParseMode.MARKDOWN)
-            return
-
-
-# ===== ЗАПУСК =====
-
-async def main():
-    global bot_instance
-    bot_instance = app
-
-    # Запуск вебхук сервера
-    asyncio.create_task(run_webhook())
-
+def main():
+    """Основная функция запуска бота"""
+    global bot_application
+    
+    # Инициализация БД
+    init_database()
+    
+    # Проверка Fragment API
+    logger.info("Checking Fragment API...")
+    health = fragment_client.health_check()
+    if health.get('ok'):
+        logger.info("✅ Fragment API available")
+    else:
+        logger.warning(f"⚠️ Fragment API unavailable: {health.get('error')}")
+    
+    # Создание приложения
+    application = Application.builder().token(BOT_TOKEN).build()
+    bot_application = application
+    
+    # Регистрация обработчиков команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("cancel", cancel))
+    
+    # Регистрация callback обработчиков
+    application.add_handler(CallbackQueryHandler(my_balance, pattern="^my_balance$"))
+    application.add_handler(CallbackQueryHandler(buy_stars_menu, pattern="^buy_stars_menu$"))
+    application.add_handler(CallbackQueryHandler(buy_premium_menu, pattern="^buy_premium_menu$"))
+    application.add_handler(CallbackQueryHandler(buy_stars_callback, pattern="^buy_stars:"))
+    application.add_handler(CallbackQueryHandler(buy_premium_callback, pattern="^buy_premium:"))
+    application.add_handler(CallbackQueryHandler(payment_callback, pattern="^pay:"))
+    application.add_handler(CallbackQueryHandler(activate_promo, pattern="^activate_promo$"))
+    application.add_handler(CallbackQueryHandler(tasks_menu, pattern="^tasks_menu$"))
+    application.add_handler(CallbackQueryHandler(view_task, pattern="^view_task:"))
+    application.add_handler(CallbackQueryHandler(check_task, pattern="^check_task:"))
+    application.add_handler(CallbackQueryHandler(about, pattern="^about$"))
+    application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
+    
+    # Админ обработчики
+    application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
+    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+    application.add_handler(CallbackQueryHandler(admin_fragment_balance, pattern="^admin_fragment_balance$"))
+    application.add_handler(CallbackQueryHandler(admin_give_stars, pattern="^admin_give_stars$"))
+    application.add_handler(CallbackQueryHandler(admin_give_premium, pattern="^admin_give_premium$"))
+    application.add_handler(CallbackQueryHandler(admin_mailing, pattern="^admin_mailing$"))
+    application.add_handler(CallbackQueryHandler(admin_blacklist_menu, pattern="^admin_blacklist$"))
+    application.add_handler(CallbackQueryHandler(admin_promocodes_menu, pattern="^admin_promocodes$"))
+    application.add_handler(CallbackQueryHandler(admin_create_promo, pattern="^admin_create_promo$"))
+    application.add_handler(CallbackQueryHandler(admin_tasks_menu, pattern="^admin_tasks$"))
+    application.add_handler(CallbackQueryHandler(admin_create_task, pattern="^admin_create_task$"))
+    application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
+    
+    # Текстовые сообщения
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_promo_text))
+    application.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, handle_admin_text))
+    
+    # Запуск вебхук сервера в отдельном потоке
+    webhook_thread = threading.Thread(target=run_webhook_server, daemon=True)
+    webhook_thread.start()
+    logger.info(f"🌐 Webhook server started on port {WEBHOOK_PORT}")
+    
     # Запуск бота
-    await app.start()
-    logger.info("🚀 Бот успешно запущен!")
-
-    # Уведомление админам
-    for admin_id in ADMIN_IDS:
-        try:
-            await app.send_message(
-                admin_id,
-                get_premium_emoji_message(
-                    f"{get_emoji('check')} *БОТ ЗАПУЩЕН* {get_emoji('check')}\n\n"
-                    f"{get_emoji('fire')} Все системы активны!"
-                ),
-                parse_mode=ParseMode.HTML
-            )
-        except:
-            pass
-
-    await asyncio.Event().wait()
-
+    logger.info("🚀 Бот запущен!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    init_database()
-
-    # Словарь типов заданий для отображения
-    TASK_TYPES = {
-        "channel_sub": {"name": "Подписка на канал", "icon": "📢"},
-        "group_join": {"name": "Вступление в группу", "icon": "👥"},
-        "bot_start": {"name": "Запуск бота", "icon": "🤖"},
-    }
-
-    if not PYFRAGMENT_AVAILABLE:
-        logger.warning("⚠️ pyfragment не установлен! Установите: pip install pyfragment")
-
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+    # Проверка наличия токена
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ ОШИБКА: Укажите BOT_TOKEN в коде!")
+        print("Получите токен у @BotFather")
+        sys.exit(1)
+    
+    # Проверка Fragment настроек
+    if FRAGMENT_MNEMONIC == "your_24_word_seed_phrase_here":
+        print("⚠️ ВНИМАНИЕ: Не указана сид-фраза Fragment!")
+        print("Бот будет работать, но отправка звезд/Premium через Fragment будет недоступна")
+    
+    main()
